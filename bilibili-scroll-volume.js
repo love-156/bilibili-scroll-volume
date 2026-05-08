@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.2.0
-// @description  按住自定义按键 + 鼠标滚轮调节B站视频音量，支持全页面触发和自定义设置
+// @version      1.4.0
+// @description  按住自定义按键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
 // @match        *://bilibili.com/video/*
@@ -73,6 +73,16 @@
         GM_setValue('requireHoverOnVideo', value);
     }
 
+    /** 获取音量步进值（百分比 1-100，默认 5） */
+    function getVolumeStepPercent() {
+        return GM_getValue('volumeStepPercent', 5);
+    }
+
+    /** 保存音量步进值 */
+    function setVolumeStepPercent(value) {
+        GM_setValue('volumeStepPercent', value);
+    }
+
     // ============ 全局状态 ============
     let isListeningForKey = false;
     let settingsPanel = null;
@@ -80,7 +90,7 @@
 
     // ============ 配置区 ============
     const CONFIG = {
-        /** 每次滚轮音量变化量 (0-1 范围) */
+        /** 每次滚轮音量变化量 (0-1 范围，会根据百分比计算) */
         volumeStep: 0.05,
         /** 是否启用音量提示UI */
         showVolumeIndicator: true,
@@ -107,6 +117,7 @@
             this.rafId = null;
             this.triggerKey = getStoredTriggerKey();
             this.requireHoverOnVideo = getRequireHoverOnVideo();
+            this.volumeStepPercent = getVolumeStepPercent();
 
             this.init();
         }
@@ -121,6 +132,12 @@
         reloadConfig() {
             this.triggerKey = getStoredTriggerKey();
             this.requireHoverOnVideo = getRequireHoverOnVideo();
+            this.volumeStepPercent = getVolumeStepPercent();
+        }
+
+        /** 获取当前音量步进值（0-1范围） */
+        getVolumeStep() {
+            return this.volumeStepPercent / 100;
         }
 
         /** 初始化 */
@@ -260,21 +277,25 @@
             if (!this.video) return;
             if (this.rafId) cancelAnimationFrame(this.rafId);
 
-            const currentVolume = this.video.volume;
-            let newVolume = currentVolume + (direction * CONFIG.volumeStep);
-            let displayVolume = newVolume;
+            const step = this.getVolumeStep();
+            // 使用当前的 displayVolume 作为基准（包含增益）
+            // 如果 lastVolume 无效（0），使用 video.volume
+            const currentDisplayVolume = (this.lastVolume > 0) ? this.lastVolume : this.video.volume;
+            let newDisplayVolume = currentDisplayVolume + (direction * step);
+            let displayVolume = newDisplayVolume;
 
-            if (newVolume <= 1) {
-                newVolume = Math.max(0, Math.min(1, newVolume));
-                this.video.volume = newVolume;
+            if (newDisplayVolume <= 1) {
+                // 回到普通音量范围
+                this.video.volume = Math.max(0, Math.min(1, newDisplayVolume));
                 if (CONFIG.enableVolumeBoost && this.gainNode) {
                     this.boostMultiplier = 1.0;
                     this.gainNode.gain.value = 1.0;
                 }
-                displayVolume = newVolume;
+                displayVolume = newDisplayVolume;
             } else if (CONFIG.enableVolumeBoost && this.gainNode) {
+                // 超过100%，使用增益
                 this.video.volume = 1.0;
-                const newBoost = this.boostMultiplier + (direction * 0.1);
+                const newBoost = this.boostMultiplier + (direction * step);
                 this.boostMultiplier = Math.max(1.0, Math.min(CONFIG.maxVolumeBoost, newBoost));
                 this.gainNode.gain.value = this.boostMultiplier;
                 displayVolume = this.boostMultiplier;
@@ -502,6 +523,75 @@
                 .sv-toggle-switch input:checked + .sv-toggle-slider:before {
                     transform: translateX(20px);
                 }
+
+                /* 滑块样式 */
+                .sv-slider-container {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                }
+                .sv-number-input {
+                    width: 50px;
+                    padding: 6px 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    text-align: center;
+                    outline: none;
+                    transition: border-color 0.2s;
+                }
+                .sv-number-input:focus {
+                    border-color: #00d9ff;
+                }
+                .sv-number-input::-webkit-inner-spin-button,
+                .sv-number-input::-webkit-outer-spin-button {
+                    -webkit-appearance: none;
+                    margin: 0;
+                }
+                .sv-number-input[type=number] {
+                    -moz-appearance: textfield;
+                }
+                .sv-unit {
+                    color: #999;
+                    font-size: 13px;
+                }
+                .sv-slider {
+                    -webkit-appearance: none;
+                    appearance: none;
+                    width: 100%;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: #e0e0e0;
+                    outline: none;
+                }
+                .sv-slider::-webkit-slider-thumb {
+                    -webkit-appearance: none;
+                    appearance: none;
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 50%;
+                    background: #00d9ff;
+                    cursor: pointer;
+                    transition: transform 0.2s;
+                }
+                .sv-slider::-webkit-slider-thumb:hover {
+                    transform: scale(1.2);
+                }
+                .sv-slider::-moz-range-thumb {
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 50%;
+                    background: #00d9ff;
+                    cursor: pointer;
+                    border: none;
+                }
+                .sv-slider-value {
+                    min-width: 36px;
+                    font-size: 13px;
+                    color: #00d9ff;
+                    font-weight: 600;
+                    text-align: right;
+                }
             `;
             document.head.appendChild(style);
 
@@ -537,6 +627,26 @@
                             <div class="sv-setting-desc">按住此键 + 滚轮调节音量</div>
                         </div>
                         <button class="sv-setting-btn sv-key-btn" id="sv-trigger-key-btn">空格</button>
+                    </div>
+                    <div class="sv-setting-item">
+                        <div>
+                            <div class="sv-setting-label">音量调节</div>
+                            <div class="sv-setting-desc">每次滚轮调节的音量变化（1-100）</div>
+                        </div>
+                        <div class="sv-slider-container">
+                            <input type="number" class="sv-number-input" id="sv-volume-step-input" min="1" max="100" value="5">
+                            <span class="sv-unit">%</span>
+                        </div>
+                    </div>
+                    <div class="sv-setting-item" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                        <div style="display: flex; justify-content: space-between; width: 100%;">
+                            <div>
+                                <div class="sv-setting-label">精细调节</div>
+                                <div class="sv-setting-desc">拖动滑块快速调节</div>
+                            </div>
+                            <span class="sv-slider-value" id="sv-volume-step-value">5%</span>
+                        </div>
+                        <input type="range" class="sv-slider" id="sv-volume-step-slider" min="1" max="100" value="5" style="width: 100%;">
                     </div>
                     <div class="sv-setting-item">
                         <div>
@@ -586,6 +696,42 @@
             const keyBtn = document.getElementById('sv-trigger-key-btn');
             keyBtn.addEventListener('click', () => {
                 enterKeyListening();
+            });
+
+            // 绑定滑块事件
+            const volumeStepSlider = document.getElementById('sv-volume-step-slider');
+            const volumeStepInput = document.getElementById('sv-volume-step-input');
+            const volumeStepValue = document.getElementById('sv-volume-step-value');
+
+            // 滑块变化时同步输入框和显示
+            volumeStepSlider.addEventListener('input', (e) => {
+                const value = parseInt(e.target.value);
+                volumeStepInput.value = value;
+                volumeStepValue.textContent = value + '%';
+            });
+            volumeStepSlider.addEventListener('change', (e) => {
+                const value = parseInt(e.target.value);
+                setVolumeStepPercent(value);
+                this.volumeStepPercent = value;
+                showToast(`音量调节已调整为 ${value}%`);
+            });
+
+            // 输入框变化时同步滑块和显示
+            volumeStepInput.addEventListener('input', (e) => {
+                let value = parseInt(e.target.value) || 1;
+                value = Math.max(1, Math.min(100, value));
+                volumeStepSlider.value = value;
+                volumeStepValue.textContent = value + '%';
+            });
+            volumeStepInput.addEventListener('change', (e) => {
+                let value = parseInt(e.target.value) || 5;
+                value = Math.max(1, Math.min(100, value));
+                volumeStepInput.value = value;
+                volumeStepSlider.value = value;
+                setVolumeStepPercent(value);
+                this.volumeStepPercent = value;
+                volumeStepValue.textContent = value + '%';
+                showToast(`音量调节已调整为 ${value}%`);
             });
 
             // 绑定开关事件
@@ -648,13 +794,26 @@
     function updateSettingsUI() {
         const key = getStoredTriggerKey();
         const requireHover = getRequireHoverOnVideo();
+        const volumeStep = getVolumeStepPercent();
         const btn = document.getElementById('sv-trigger-key-btn');
         const toggle = document.getElementById('sv-require-hover-toggle');
+        const slider = document.getElementById('sv-volume-step-slider');
+        const input = document.getElementById('sv-volume-step-input');
+        const sliderValue = document.getElementById('sv-volume-step-value');
         if (btn) {
             btn.textContent = keyCodeToName(key);
         }
         if (toggle) {
             toggle.checked = requireHover;
+        }
+        if (slider) {
+            slider.value = volumeStep;
+        }
+        if (input) {
+            input.value = volumeStep;
+        }
+        if (sliderValue) {
+            sliderValue.textContent = volumeStep + '%';
         }
     }
 
