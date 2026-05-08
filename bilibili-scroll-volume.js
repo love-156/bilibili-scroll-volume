@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.4.0
-// @description  按住自定义按键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值
+// @version      1.6.0
+// @description  按住自定义按键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
 // @match        *://bilibili.com/video/*
@@ -73,6 +73,16 @@
         GM_setValue('requireHoverOnVideo', value);
     }
 
+    /** 获取全屏模式（1=禁用，2=启用，3=直接触发，默认3） */
+    function getFullscreenMode() {
+        return GM_getValue('fullscreenMode', 3);
+    }
+
+    /** 保存全屏模式 */
+    function setFullscreenMode(value) {
+        GM_setValue('fullscreenMode', value);
+    }
+
     /** 获取音量步进值（百分比 1-100，默认 5） */
     function getVolumeStepPercent() {
         return GM_getValue('volumeStepPercent', 5);
@@ -81,6 +91,26 @@
     /** 保存音量步进值 */
     function setVolumeStepPercent(value) {
         GM_setValue('volumeStepPercent', value);
+    }
+
+    /** 获取是否启用区域触发（默认 false） */
+    function getTriggerZoneEnabled() {
+        return GM_getValue('triggerZoneEnabled', false);
+    }
+
+    /** 保存区域触发开关 */
+    function setTriggerZoneEnabled(value) {
+        GM_setValue('triggerZoneEnabled', value);
+    }
+
+    /** 获取区域矩形（百分比形式：{x, y, width, height}） */
+    function getTriggerZoneRect() {
+        return GM_getValue('triggerZoneRect', null);
+    }
+
+    /** 保存区域矩形（百分比形式） */
+    function setTriggerZoneRect(rect) {
+        GM_setValue('triggerZoneRect', rect);
     }
 
     // ============ 全局状态 ============
@@ -110,6 +140,7 @@
             this.video = null;
             this.isTriggerKeyPressed = false;
             this.volumeIndicator = null;
+            this.volumeIndicatorFull = null;
             this.audioContext = null;
             this.gainNode = null;
             this.lastVolume = 0;
@@ -118,6 +149,14 @@
             this.triggerKey = getStoredTriggerKey();
             this.requireHoverOnVideo = getRequireHoverOnVideo();
             this.volumeStepPercent = getVolumeStepPercent();
+            this.fullscreenMode = getFullscreenMode();
+            this.indicatorTimeout = null;
+            this.triggerZoneEnabled = getTriggerZoneEnabled();
+            this.triggerZoneRect = getTriggerZoneRect();
+            this.triggerZoneElement = null;
+            this.isInTriggerZone = false;
+            this.isEditingZone = false;
+            this.zoneWheelHandler = null;
 
             this.init();
         }
@@ -133,6 +172,310 @@
             this.triggerKey = getStoredTriggerKey();
             this.requireHoverOnVideo = getRequireHoverOnVideo();
             this.volumeStepPercent = getVolumeStepPercent();
+            this.fullscreenMode = getFullscreenMode();
+            this.triggerZoneEnabled = getTriggerZoneEnabled();
+            this.triggerZoneRect = getTriggerZoneRect();
+            this.updateTriggerZoneElement();
+        }
+
+        /** 创建区域触发元素 */
+        createTriggerZoneElement() {
+            const zone = document.createElement('div');
+            zone.id = 'sv-trigger-zone';
+            zone.className = 'sv-trigger-zone';
+            document.body.appendChild(zone);
+            this.triggerZoneElement = zone;
+            this.updateTriggerZoneElement();
+        }
+
+        /** 更新触发区域位置 */
+        updateTriggerZoneElement() {
+            if (!this.triggerZoneElement) return;
+            
+            if (this.triggerZoneEnabled && this.triggerZoneRect) {
+                const rect = this.triggerZoneRect;
+                const zone = this.triggerZoneElement;
+                
+                zone.style.left = rect.x + '%';
+                zone.style.top = rect.y + '%';
+                zone.style.width = rect.width + '%';
+                zone.style.height = rect.height + '%';
+                zone.style.display = 'block';
+            } else {
+                this.triggerZoneElement.style.display = 'none';
+            }
+        }
+
+        /** 检测鼠标是否在触发区域内 */
+        checkTriggerZone(e) {
+            if (!this.triggerZoneEnabled || !this.triggerZoneRect) {
+                return false;
+            }
+            
+            const x = (e.clientX / window.innerWidth) * 100;
+            const y = (e.clientY / window.innerHeight) * 100;
+            const rect = this.triggerZoneRect;
+            
+            return x >= rect.x && x <= rect.x + rect.width &&
+                   y >= rect.y && y <= rect.y + rect.height;
+        }
+
+        /** 开始编辑触发区域 */
+        startZoneEditing() {
+            this.isEditingZone = true;
+            
+            // 隐藏设置面板
+            settingsPanel.classList.remove('show');
+            
+            // 获取或创建编辑遮罩
+            let overlay = document.getElementById('sv-zone-editor-overlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.id = 'sv-zone-editor-overlay';
+                overlay.className = 'sv-zone-editor-overlay';
+                document.body.appendChild(overlay);
+            }
+            
+            // 获取或创建编辑框
+            let box = document.getElementById('sv-zone-editor-box');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'sv-zone-editor-box';
+                box.className = 'sv-zone-editor-box';
+                overlay.appendChild(box);
+                
+                // 添加四个角拖拽手柄
+                ['nw', 'ne', 'sw', 'se'].forEach(pos => {
+                    const handle = document.createElement('div');
+                    handle.className = 'sv-zone-editor-handle ' + pos;
+                    box.appendChild(handle);
+                });
+                
+                // 添加底部按钮栏
+                const buttonBar = document.createElement('div');
+                buttonBar.className = 'sv-zone-editor-buttons';
+                buttonBar.innerHTML = `
+                    <button class="sv-zone-btn sv-zone-btn-cancel">取消</button>
+                    <button class="sv-zone-btn sv-zone-btn-save">保存</button>
+                `;
+                overlay.appendChild(buttonBar);
+            }
+            
+            // 设置初始区域
+            const rect = this.triggerZoneRect || { x: 10, y: 10, width: 80, height: 80 };
+            box.style.left = rect.x + '%';
+            box.style.top = rect.y + '%';
+            box.style.width = rect.width + '%';
+            box.style.height = rect.height + '%';
+            
+            overlay.classList.add('show');
+            
+            // 编辑模式下隐藏原有的触发区域元素
+            if (this.triggerZoneElement) {
+                this.triggerZoneElement.style.display = 'none';
+            }
+            
+            // 设置拖拽状态
+            this.zoneEditorState = {
+                isDragging: false,
+                isResizing: false,
+                resizeCorner: null,
+                startX: 0,
+                startY: 0,
+                startRect: { ...rect }
+            };
+            
+            this.setupZoneEditorEvents(box, overlay);
+        }
+
+        /** 设置区域编辑事件 */
+        setupZoneEditorEvents(box, overlay) {
+            const handleMouseMove = (e) => {
+                const state = this.zoneEditorState;
+                const dx = ((e.clientX - state.startX) / window.innerWidth) * 100;
+                const dy = ((e.clientY - state.startY) / window.innerHeight) * 100;
+                
+                if (state.isResizing) {
+                    const rect = state.startRect;
+                    const corner = state.resizeCorner;
+                    
+                    // 缩放逻辑：只增大，不减小
+                    // nw: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
+                    // ne: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
+                    // sw: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
+                    // se: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
+                    
+                    // 向上拖动(n角)减小高度
+                    if (corner.includes('n') && dy < 0) {
+                        const newHeight = Math.max(5, rect.height + dy);
+                        box.style.height = newHeight + '%';
+                        // 不移动top，保持原位
+                    }
+                    // 向下拖动(s角)增大高度
+                    if (corner.includes('s') && dy > 0) {
+                        box.style.height = Math.max(5, rect.height + dy) + '%';
+                    }
+                    // 向左拖动(w角)减小宽度
+                    if (corner.includes('w') && dx < 0) {
+                        const newWidth = Math.max(5, rect.width + dx);
+                        box.style.width = newWidth + '%';
+                        // 不移动left，保持原位
+                    }
+                    // 向右拖动(e角)增大宽度
+                    if (corner.includes('e') && dx > 0) {
+                        box.style.width = Math.max(5, rect.width + dx) + '%';
+                    }
+                } else if (state.isDragging) {
+                    const rect = state.startRect;
+                    box.style.left = Math.max(0, Math.min(100 - rect.width, rect.x + dx)) + '%';
+                    box.style.top = Math.max(0, Math.min(100 - rect.height, rect.y + dy)) + '%';
+                }
+            };
+            
+            const handleMouseUp = () => {
+                document.removeEventListener('mousemove', handleMouseMove);
+                document.removeEventListener('mouseup', handleMouseUp);
+                // 更新startRect为当前位置，下次拖动以当前位置为起点
+                if (this.zoneEditorState) {
+                    this.zoneEditorState.startRect = {
+                        x: parseFloat(box.style.left),
+                        y: parseFloat(box.style.top),
+                        width: parseFloat(box.style.width),
+                        height: parseFloat(box.style.height)
+                    };
+                }
+            };
+            
+            // 绑定取消按钮
+            const cancelBtn = overlay.querySelector('.sv-zone-btn-cancel');
+            cancelBtn.addEventListener('click', () => {
+                this.finishZoneEditing(false);
+                showToast('已取消编辑');
+            });
+            
+            // 绑定保存按钮
+            const saveBtn = overlay.querySelector('.sv-zone-btn-save');
+            saveBtn.addEventListener('click', () => {
+                this.finishZoneEditing(true);
+            });
+            
+            // 处理框拖拽
+            box.addEventListener('mousedown', (e) => {
+                if (e.target.classList.contains('sv-zone-editor-handle')) return;
+                
+                e.preventDefault();
+                e.stopPropagation();
+                
+                // 更新状态
+                this.zoneEditorState.isDragging = true;
+                this.zoneEditorState.isResizing = false;
+                this.zoneEditorState.resizeCorner = null;
+                this.zoneEditorState.startX = e.clientX;
+                this.zoneEditorState.startY = e.clientY;
+                // 使用当前框体位置作为起点
+                this.zoneEditorState.startRect = {
+                    x: parseFloat(box.style.left),
+                    y: parseFloat(box.style.top),
+                    width: parseFloat(box.style.width),
+                    height: parseFloat(box.style.height)
+                };
+                
+                document.addEventListener('mousemove', handleMouseMove);
+                document.addEventListener('mouseup', handleMouseUp, { once: true });
+            });
+            
+            // 处理角拖拽
+            box.querySelectorAll('.sv-zone-editor-handle').forEach(handle => {
+                handle.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    
+                    // 更新状态
+                    this.zoneEditorState.isDragging = false;
+                    this.zoneEditorState.isResizing = true;
+                    this.zoneEditorState.resizeCorner = handle.classList[1];
+                    this.zoneEditorState.startX = e.clientX;
+                    this.zoneEditorState.startY = e.clientY;
+                    // 使用当前框体位置作为起点
+                    this.zoneEditorState.startRect = {
+                        x: parseFloat(box.style.left),
+                        y: parseFloat(box.style.top),
+                        width: parseFloat(box.style.width),
+                        height: parseFloat(box.style.height)
+                    };
+                    
+                    document.addEventListener('mousemove', handleMouseMove);
+                    document.addEventListener('mouseup', handleMouseUp, { once: true });
+                });
+            });
+            
+            // 左键点击遮罩不响应（阻止事件穿透到video等）
+            overlay.addEventListener('mousedown', (e) => {
+                if (e.target === overlay || e.target.classList.contains('sv-zone-editor-buttons')) {
+                    e.stopPropagation();
+                }
+            });
+        }
+
+        /** 完成区域编辑 */
+        finishZoneEditing(save) {
+            this.isEditingZone = false;
+            const overlay = document.getElementById('sv-zone-editor-overlay');
+            const box = document.getElementById('sv-zone-editor-box');
+            
+            if (overlay) {
+                overlay.classList.remove('show');
+            }
+            
+            // 恢复原有触发区域的显示
+            if (this.triggerZoneElement) {
+                this.updateTriggerZoneElement();
+            }
+            
+            if (save && box) {
+                // 保存区域
+                const newRect = {
+                    x: parseFloat(box.style.left),
+                    y: parseFloat(box.style.top),
+                    width: parseFloat(box.style.width),
+                    height: parseFloat(box.style.height)
+                };
+                setTriggerZoneRect(newRect);
+                this.triggerZoneRect = newRect;
+                this.updateTriggerZoneElement();
+                showToast('触发区域已保存');
+            }
+            
+            this.zoneEditorState = null;
+        }
+
+        /** 检测是否处于视频全屏或网页全屏状态 */
+        checkFullscreenState() {
+            // 通过 bpx-player-container 的 data-screen 属性判断
+            const playerContainer = document.querySelector('.bpx-player-container');
+            if (playerContainer) {
+                const screen = playerContainer.getAttribute('data-screen');
+                // data-screen="web" 表示网页全屏
+                // data-screen="full" 表示视频全屏
+                if (screen === 'web' || screen === 'full') {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** 尝试将全屏指示器添加到播放器容器 */
+        tryAppendIndicatorToPlayer() {
+            const playerContainer = document.querySelector('.bpx-player-container');
+            if (playerContainer && this.volumeIndicatorFull) {
+                // 检查是否已经添加过
+                if (!playerContainer.contains(this.volumeIndicatorFull)) {
+                    playerContainer.appendChild(this.volumeIndicatorFull);
+                }
+            } else {
+                // 播放器还没加载，稍后重试
+                setTimeout(() => this.tryAppendIndicatorToPlayer(), 500);
+            }
         }
 
         /** 获取当前音量步进值（0-1范围） */
@@ -169,6 +512,7 @@
                 if (this.video) {
                     this.setupVolumeBoost();
                     this.setupWheelListener();
+                    this.createTriggerZoneElement();
                 } else {
                     setTimeout(tryInit, 500);
                 }
@@ -245,9 +589,109 @@
             }
         }
 
+        /** 检测鼠标是否在触发区域内 */
+        checkTriggerZone(e) {
+            if (!this.triggerZoneEnabled || !this.triggerZoneRect) {
+                return false;
+            }
+            
+            const x = (e.clientX / window.innerWidth) * 100;
+            const y = (e.clientY / window.innerHeight) * 100;
+            const rect = this.triggerZoneRect;
+            
+            return x >= rect.x && x <= rect.x + rect.width &&
+                   y >= rect.y && y <= rect.y + rect.height;
+        }
+
+        /** 设置区域内滚轮拦截 */
+        setupZoneWheelCapture() {
+            if (this.zoneWheelHandler) return;
+            
+            this.zoneWheelHandler = (e) => {
+                if (this.isInTriggerZone) {
+                    e.stopPropagation();
+                }
+            };
+            
+            // 在区域元素上添加滚轮事件拦截
+            if (this.triggerZoneElement) {
+                this.triggerZoneElement.addEventListener('wheel', this.zoneWheelHandler, { passive: false });
+            }
+            
+            // 同时在document上拦截，防止冒泡
+            document.addEventListener('wheel', this.zoneWheelHandler, true);
+        }
+
+        /** 移除滚轮拦截 */
+        removeZoneWheelCapture() {
+            if (this.zoneWheelHandler) {
+                if (this.triggerZoneElement) {
+                    this.triggerZoneElement.removeEventListener('wheel', this.zoneWheelHandler);
+                }
+                document.removeEventListener('wheel', this.zoneWheelHandler, true);
+                this.zoneWheelHandler = null;
+            }
+        }
+
         /** 设置滚轮监听 */
         setupWheelListener() {
+            // 设置鼠标移动监听以检测是否在触发区域内
+            document.addEventListener('mousemove', (e) => {
+                const wasInZone = this.isInTriggerZone;
+                this.isInTriggerZone = this.checkTriggerZone(e);
+                
+                if (this.triggerZoneElement) {
+                    if (this.isInTriggerZone) {
+                        this.triggerZoneElement.classList.add('highlight');
+                        this.triggerZoneElement.classList.add('active-zone');
+                        // 添加滚轮拦截
+                        this.setupZoneWheelCapture();
+                    } else {
+                        this.triggerZoneElement.classList.remove('highlight');
+                        this.triggerZoneElement.classList.remove('active-zone');
+                        this.removeZoneWheelCapture();
+                    }
+                }
+                
+                // 更新视觉反馈
+                if (wasInZone !== this.isInTriggerZone) {
+                    if (this.isInTriggerZone) {
+                        document.body.classList.add('scroll-volume-active');
+                    } else if (!this.isTriggerKeyPressed) {
+                        document.body.classList.remove('scroll-volume-active');
+                    }
+                }
+            });
+            
             this.video.addEventListener('wheel', (e) => {
+                const inFullscreen = this.checkFullscreenState();
+                const inZone = this.isInTriggerZone;
+
+                // 非全屏状态
+                if (!inFullscreen) {
+                    // 区域触发或按键触发即可
+                    if (!inZone && !this.isTriggerKeyPressed) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const delta = e.deltaY > 0 ? -1 : 1;
+                    this.adjustVolume(delta);
+                    return;
+                }
+
+                // 全屏状态：根据模式决定
+                // 模式1：禁用
+                if (this.fullscreenMode === 1) return;
+
+                // 模式3：直接触发（无需按键），但区域触发也有效
+                if (this.fullscreenMode === 3 || inZone) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const delta = e.deltaY > 0 ? -1 : 1;
+                    this.adjustVolume(delta);
+                    return;
+                }
+
+                // 模式2：需要按键触发
                 if (!this.isTriggerKeyPressed) return;
                 e.preventDefault();
                 e.stopPropagation();
@@ -256,16 +700,48 @@
             }, { passive: false });
 
             document.addEventListener('wheel', (e) => {
+                const inFullscreen = this.checkFullscreenState();
+                const inZone = this.isInTriggerZone;
+
+                // 非全屏状态
+                if (!inFullscreen) {
+                    // 区域触发或按键触发即可
+                    if (!inZone && !this.isTriggerKeyPressed) return;
+                    if (e.target.closest('video')) return;
+                    if (this.requireHoverOnVideo) {
+                        if (this.video && this.video.matches(':hover')) {
+                            const delta = e.deltaY > 0 ? -1 : 1;
+                            this.adjustVolume(delta);
+                        }
+                    } else {
+                        const delta = e.deltaY > 0 ? -1 : 1;
+                        this.adjustVolume(delta);
+                    }
+                    return;
+                }
+
+                // 全屏状态：根据模式决定
+                // 模式1：禁用
+                if (this.fullscreenMode === 1) return;
+
+                // 模式3：直接触发（无需按键），但区域触发也有效
+                if (this.fullscreenMode === 3 || inZone) {
+                    if (this.video && this.video.matches(':hover')) {
+                        const delta = e.deltaY > 0 ? -1 : 1;
+                        this.adjustVolume(delta);
+                    }
+                    return;
+                }
+
+                // 模式2：需要按键触发
                 if (!this.isTriggerKeyPressed) return;
                 if (e.target.closest('video')) return;
-                // 根据配置决定是否需要鼠标在视频上
                 if (this.requireHoverOnVideo) {
                     if (this.video && this.video.matches(':hover')) {
                         const delta = e.deltaY > 0 ? -1 : 1;
                         this.adjustVolume(delta);
                     }
                 } else {
-                    // 不需要鼠标在视频上，任意位置都触发
                     const delta = e.deltaY > 0 ? -1 : 1;
                     this.adjustVolume(delta);
                 }
@@ -320,27 +796,55 @@
             const style = document.createElement('style');
             style.textContent = `
                 #scroll-volume-indicator {
-                    position: fixed;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    display: flex;
+                    position: fixed !important;
+                    top: 50% !important;
+                    left: 50% !important;
+                    transform: translate(-50%, -50%) !important;
+                    display: flex !important;
                     align-items: center;
                     gap: 12px;
                     padding: 16px 24px;
-                    background: rgba(0, 0, 0, 0.85);
+                    background: rgba(0, 0, 0, 0.85) !important;
                     border-radius: 12px;
                     color: #fff;
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     font-size: 14px;
-                    z-index: 999999;
-                    opacity: 0;
-                    pointer-events: none;
+                    z-index: 2147483647 !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                    transition: opacity 0.2s ease;
+                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                    /* 隔离 stacking context，确保全屏模式下 z-index 生效 */
+                    isolation: isolate !important;
+                }
+                #scroll-volume-indicator.show {
+                    opacity: 1 !important;
+                }
+                /* 全屏音量指示器（放在播放器容器内） */
+                #scroll-volume-indicator-full {
+                    position: absolute !important;
+                    top: 50% !important;
+                    left: 50% !important;
+                    transform: translate(-50%, -50%) !important;
+                    display: flex !important;
+                    align-items: center;
+                    gap: 12px;
+                    padding: 16px 24px;
+                    background: rgba(0, 0, 0, 0.85) !important;
+                    border-radius: 12px;
+                    color: #fff;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    font-size: 14px;
+                    z-index: 2147483647 !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
                     transition: opacity 0.2s ease;
                     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
                 }
-                #scroll-volume-indicator.show { opacity: 1; }
-                .scroll-volume-icon { display: flex; color: #00d9ff; }
+                #scroll-volume-indicator-full.show {
+                    opacity: 1 !important;
+                }
+                .scroll-volume-icon { display: flex !important; color: #00d9ff; }
                 .scroll-volume-bar-container { position: relative; width: 120px; height: 6px; }
                 .scroll-volume-bar {
                     position: absolute; top: 0; left: 0; height: 100%;
@@ -367,7 +871,7 @@
                     background: #fff;
                     border-radius: 12px;
                     box-shadow: 0 8px 32px rgba(0,0,0,0.2);
-                    z-index: 999998;
+                    z-index: 2147483646 !important;
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     overflow: hidden;
                     display: none;
@@ -427,7 +931,7 @@
                 }
                 .sv-setting-desc {
                     font-size: 12px;
-                    color: #999;
+                    color: #333;
                     margin-top: 4px;
                 }
 
@@ -442,7 +946,7 @@
                     display: none;
                     justify-content: center;
                     align-items: center;
-                    z-index: 999999;
+                    z-index: 2147483645 !important;
                 }
                 .bilibili-key-listening-overlay.show { display: flex; }
                 .bilibili-key-listening-box {
@@ -458,7 +962,7 @@
                 }
                 .bilibili-key-listening-hint {
                     font-size: 14px;
-                    color: #999;
+                    color: #333;
                 }
                 .bilibili-key-listening-key {
                     font-size: 32px;
@@ -532,16 +1036,19 @@
                 }
                 .sv-number-input {
                     width: 50px;
-                    padding: 6px 8px;
-                    border: 1px solid #ddd;
+                    padding: 8px 12px;
+                    border: none;
                     border-radius: 6px;
                     font-size: 13px;
                     text-align: center;
                     outline: none;
                     transition: border-color 0.2s;
+                    background: #f0f0f0;
+                    color: #333;
                 }
                 .sv-number-input:focus {
-                    border-color: #00d9ff;
+                    border: none;
+                    background: #e0e0e0;
                 }
                 .sv-number-input::-webkit-inner-spin-button,
                 .sv-number-input::-webkit-outer-spin-button {
@@ -552,7 +1059,7 @@
                     -moz-appearance: textfield;
                 }
                 .sv-unit {
-                    color: #999;
+                    color: #333;
                     font-size: 13px;
                 }
                 .sv-slider {
@@ -585,12 +1092,119 @@
                     cursor: pointer;
                     border: none;
                 }
+                /* 下拉框样式 */
+                .sv-select-input {
+                    padding: 8px 12px;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    outline: none;
+                    background: #f0f0f0;
+                    color: #333;
+                    cursor: pointer;
+                    transition: background 0.2s;
+                    min-width: 80px;
+                }
+                .sv-select-input:hover {
+                    background: #e0e0e0;
+                }
                 .sv-slider-value {
                     min-width: 36px;
                     font-size: 13px;
                     color: #00d9ff;
                     font-weight: 600;
                     text-align: right;
+                }
+
+                /* 区域触发样式 */
+                .sv-trigger-zone {
+                    position: fixed;
+                    border: 2px dashed rgba(0, 217, 255, 0.6);
+                    background: rgba(0, 217, 255, 0.1);
+                    pointer-events: none;
+                    z-index: 2147483644 !important;
+                    display: none;
+                    transition: border-color 0.3s, background 0.3s;
+                }
+                .sv-trigger-zone.active {
+                    border-color: rgba(0, 217, 255, 0.9);
+                    background: rgba(0, 217, 255, 0.2);
+                }
+                .sv-trigger-zone.highlight {
+                    border-color: rgba(0, 255, 136, 0.9);
+                    background: rgba(0, 255, 136, 0.25);
+                }
+                .sv-trigger-zone.active-zone {
+                    pointer-events: all !important;
+                    /* 完全覆盖区域，拦截滚轮等事件 */
+                    z-index: 2147483643 !important;
+                }
+
+                /* 区域编辑遮罩 */
+                .sv-zone-editor-overlay {
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: rgba(0, 0, 0, 0.5);
+                    z-index: 2147483643 !important;
+                    display: none;
+                }
+                .sv-zone-editor-overlay.show {
+                    display: block;
+                }
+                .sv-zone-editor-box {
+                    position: absolute;
+                    border: 2px solid #00d9ff;
+                    background: rgba(0, 217, 255, 0.1);
+                    cursor: move;
+                }
+                .sv-zone-editor-handle {
+                    position: absolute;
+                    width: 12px;
+                    height: 12px;
+                    background: #00d9ff;
+                    border-radius: 50%;
+                }
+                .sv-zone-editor-handle.nw { top: -6px; left: -6px; cursor: nw-resize; }
+                .sv-zone-editor-handle.ne { top: -6px; right: -6px; cursor: ne-resize; }
+                .sv-zone-editor-handle.sw { bottom: -6px; left: -6px; cursor: sw-resize; }
+                .sv-zone-editor-handle.se { bottom: -6px; right: -6px; cursor: se-resize; }
+
+                /* 区域编辑按钮样式 */
+                .sv-zone-editor-buttons {
+                    position: fixed;
+                    bottom: 30px;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    display: flex;
+                    gap: 16px;
+                    z-index: 2147483645 !important;
+                }
+                .sv-zone-btn {
+                    padding: 12px 32px;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+                .sv-zone-btn-cancel {
+                    background: rgba(255, 255, 255, 0.9);
+                    color: #666;
+                }
+                .sv-zone-btn-cancel:hover {
+                    background: #fff;
+                    color: #333;
+                }
+                .sv-zone-btn-save {
+                    background: #00d9ff;
+                    color: #fff;
+                }
+                .sv-zone-btn-save:hover {
+                    background: #00b8d9;
                 }
             `;
             document.head.appendChild(style);
@@ -612,6 +1226,26 @@
             `;
             document.body.appendChild(indicator);
 
+            // 全屏音量指示器（放在播放器容器内）
+            const indicatorFull = document.createElement('div');
+            indicatorFull.id = 'scroll-volume-indicator-full';
+            indicatorFull.innerHTML = `
+                <div class="scroll-volume-icon">
+                    <svg viewBox="0 0 24 24" width="24" height="24">
+                        <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+                    </svg>
+                </div>
+                <div class="scroll-volume-bar-container">
+                    <div class="scroll-volume-bar"></div>
+                    <div class="scroll-volume-bar-bg"></div>
+                </div>
+                <div class="scroll-volume-value">100%</div>
+            `;
+
+            // 等待播放器加载后，将其添加到播放器容器内
+            this.volumeIndicatorFull = indicatorFull;
+            this.tryAppendIndicatorToPlayer();
+
             // 设置面板
             settingsPanel = document.createElement('div');
             settingsPanel.className = 'bilibili-scroll-volume-settings';
@@ -621,6 +1255,17 @@
                     <button class="sv-settings-close">&times;</button>
                 </div>
                 <div class="sv-settings-body">
+                    <div class="sv-setting-item">
+                        <div>
+                            <div class="sv-setting-label">全屏模式</div>
+                            <div class="sv-setting-desc">视频/网页全屏时的触发方式</div>
+                        </div>
+                        <select class="sv-select-input sv-key-btn" id="sv-fullscreen-mode-select">
+                            <option value="1">禁用</option>
+                            <option value="2">启用</option>
+                            <option value="3" selected>直接触发（无需按键）</option>
+                        </select>
+                    </div>
                     <div class="sv-setting-item">
                         <div>
                             <div class="sv-setting-label">触发按键</div>
@@ -658,6 +1303,19 @@
                             <span class="sv-toggle-slider"></span>
                         </label>
                     </div>
+                    <div class="sv-setting-item" id="sv-zone-setting-item">
+                        <div>
+                            <div class="sv-setting-label">指定区域触发</div>
+                            <div class="sv-setting-desc">鼠标在该区域内时无需按键即可触发</div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <label class="sv-toggle-switch">
+                                <input type="checkbox" id="sv-trigger-zone-toggle">
+                                <span class="sv-toggle-slider"></span>
+                            </label>
+                            <button class="sv-setting-btn sv-key-btn" id="sv-edit-zone-btn" style="background: #e8f8ff; color: #00d9ff;">编辑区域</button>
+                        </div>
+                    </div>
                 </div>
             `;
             document.body.appendChild(settingsPanel);
@@ -682,8 +1340,22 @@
 
             this.volumeIndicator = indicator;
 
+            // 初始化全屏状态监听
+            this.initFullscreenListener();
+
             // 绑定设置面板事件
             this.bindSettingsEvents();
+        }
+
+        /** 初始化全屏状态监听 */
+        initFullscreenListener() {
+            const updateFullscreenState = () => {
+                this.isFullscreen = this.checkFullscreenState();
+            };
+
+            document.addEventListener('fullscreenchange', updateFullscreenState);
+            document.addEventListener('webkitfullscreenchange', updateFullscreenState);
+            document.addEventListener('msfullscreenchange', updateFullscreenState);
         }
 
         /** 绑定设置面板事件 */
@@ -696,6 +1368,16 @@
             const keyBtn = document.getElementById('sv-trigger-key-btn');
             keyBtn.addEventListener('click', () => {
                 enterKeyListening();
+            });
+
+            // 绑定全屏模式选择事件
+            const fullscreenModeSelect = document.getElementById('sv-fullscreen-mode-select');
+            fullscreenModeSelect.addEventListener('change', (e) => {
+                const value = parseInt(e.target.value);
+                setFullscreenMode(value);
+                this.fullscreenMode = value;
+                const modeText = { 1: '禁用', 2: '启用', 3: '直接触发' };
+                showToast(`全屏模式已调整为: ${modeText[value]}`);
             });
 
             // 绑定滑块事件
@@ -742,30 +1424,66 @@
                 this.requireHoverOnVideo = requireHover;
                 showToast(requireHover ? '已开启：需鼠标在视频上' : '已关闭：页面任意位置均可触发');
             });
+
+            // 绑定区域触发开关
+            const zoneToggle = document.getElementById('sv-trigger-zone-toggle');
+            zoneToggle.addEventListener('change', (e) => {
+                const enabled = e.target.checked;
+                setTriggerZoneEnabled(enabled);
+                this.triggerZoneEnabled = enabled;
+                this.updateTriggerZoneElement();
+                showToast(enabled ? '已开启区域触发' : '已关闭区域触发');
+            });
+
+            // 绑定编辑区域按钮
+            const editZoneBtn = document.getElementById('sv-edit-zone-btn');
+            editZoneBtn.addEventListener('click', () => {
+                this.startZoneEditing();
+            });
         }
 
         updateVolumeIndicator(volume) {
-            if (!this.volumeIndicator || !CONFIG.showVolumeIndicator) return;
+            if (!CONFIG.showVolumeIndicator) return;
 
             const percentage = Math.round(volume * 100);
-            const bar = this.volumeIndicator.querySelector('.scroll-volume-bar');
-            const value = this.volumeIndicator.querySelector('.scroll-volume-value');
+            const inFullscreen = this.checkFullscreenState();
+
+            // 根据全屏状态选择指示器
+            const currentIndicator = inFullscreen ? this.volumeIndicatorFull : this.volumeIndicator;
+            if (!currentIndicator) return;
+
+            const bar = currentIndicator.querySelector('.scroll-volume-bar');
+            const valueEl = currentIndicator.querySelector('.scroll-volume-value');
 
             bar.style.width = `${Math.min(100, percentage)}%`;
-            value.textContent = `${percentage}%`;
+            valueEl.textContent = `${percentage}%`;
 
             if (percentage > 100) {
-                value.classList.add('boosted');
+                valueEl.classList.add('boosted');
                 bar.style.background = 'linear-gradient(90deg, #ff6b6b, #ff4757)';
             } else {
-                value.classList.remove('boosted');
+                valueEl.classList.remove('boosted');
                 bar.style.background = 'linear-gradient(90deg, #00d9ff, #00ff88)';
             }
 
-            this.volumeIndicator.classList.add('show');
+            // 全屏模式：显示内嵌指示器，隐藏全局指示器
+            // 普通模式：显示全局指示器，隐藏内嵌指示器
+            if (inFullscreen) {
+                this.volumeIndicator.classList.remove('show');
+                currentIndicator.classList.add('show');
+            } else {
+                if (this.volumeIndicatorFull) {
+                    this.volumeIndicatorFull.classList.remove('show');
+                }
+                this.volumeIndicator.classList.add('show');
+            }
+
             clearTimeout(this.indicatorTimeout);
             this.indicatorTimeout = setTimeout(() => {
                 this.volumeIndicator.classList.remove('show');
+                if (this.volumeIndicatorFull) {
+                    this.volumeIndicatorFull.classList.remove('show');
+                }
             }, CONFIG.indicatorDuration);
         }
     }
@@ -795,11 +1513,15 @@
         const key = getStoredTriggerKey();
         const requireHover = getRequireHoverOnVideo();
         const volumeStep = getVolumeStepPercent();
+        const fullscreenMode = getFullscreenMode();
+        const zoneEnabled = getTriggerZoneEnabled();
         const btn = document.getElementById('sv-trigger-key-btn');
         const toggle = document.getElementById('sv-require-hover-toggle');
         const slider = document.getElementById('sv-volume-step-slider');
         const input = document.getElementById('sv-volume-step-input');
         const sliderValue = document.getElementById('sv-volume-step-value');
+        const fullscreenSelect = document.getElementById('sv-fullscreen-mode-select');
+        const zoneToggle = document.getElementById('sv-trigger-zone-toggle');
         if (btn) {
             btn.textContent = keyCodeToName(key);
         }
@@ -814,6 +1536,12 @@
         }
         if (sliderValue) {
             sliderValue.textContent = volumeStep + '%';
+        }
+        if (fullscreenSelect) {
+            fullscreenSelect.value = fullscreenMode;
+        }
+        if (zoneToggle) {
+            zoneToggle.checked = zoneEnabled;
         }
     }
 
