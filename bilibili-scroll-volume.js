@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.6.0
-// @description  按住自定义按键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
+// @version      1.7.2
+// @description  按住V键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
 // @match        *://bilibili.com/video/*
@@ -18,10 +18,8 @@
 
     /**
      * ============================================
-     * Bilibili 滚轮音量控制插件 v1.1.0
-     * ============================================
      * 功能：按住指定按键 + 鼠标滚轮调节视频音量
-     * 默认快捷键：空格键 (Space)
+     * 默认快捷键：V键 (KeyV)
      * 支持自定义按键设置
      * ============================================
      */
@@ -53,9 +51,9 @@
         return code;
     }
 
-    /** 获取当前存储的触发键，默认左Shift */
+    /** 获取当前存储的触发键，默认V键 */
     function getStoredTriggerKey() {
-        return GM_getValue('triggerKey', 'ShiftLeft');
+        return GM_getValue('triggerKey', 'KeyV');
     }
 
     /** 保存触发键 */
@@ -198,15 +196,6 @@
             document.body.appendChild(zone);
             this.triggerZoneElement = zone;
             this.updateTriggerZoneElement();
-            
-            // 在触发区域上直接监听滚轮，阻止穿透并调节音量
-            zone.addEventListener('wheel', (e) => {
-                if (!this.isInTriggerZone) return;
-                e.preventDefault();
-                e.stopPropagation();
-                const delta = e.deltaY > 0 ? -1 : 1;
-                this.adjustVolume(delta);
-            }, { passive: false });
         }
 
         /** 更新触发区域位置 */
@@ -222,8 +211,6 @@
                 zone.style.width = rect.width + '%';
                 zone.style.height = rect.height + '%';
                 zone.style.display = 'block';
-                // 显示时允许指针事件，让滚轮事件能被区域捕获
-                zone.style.pointerEvents = 'auto';
                 // 控制透明度
                 zone.style.opacity = this.showTriggerZone ? '' : '0';
             } else {
@@ -510,12 +497,6 @@
                 });
             });
             
-            // 左键点击遮罩不响应（阻止事件穿透到video等）
-            overlay.addEventListener('mousedown', (e) => {
-                if (e.target === overlay || e.target.classList.contains('sv-zone-editor-buttons')) {
-                    e.stopPropagation();
-                }
-            });
         }
 
         /** 完成区域编辑 */
@@ -704,28 +685,6 @@
                    y >= rect.y && y <= rect.y + rect.height;
         }
 
-        /** 区域内滚轮拦截（防止页面滚动穿透） */
-        setupZoneWheelBlock() {
-            if (this.zoneWheelBlockHandler) return;
-
-            this.zoneWheelBlockHandler = (e) => {
-                if (this.isInTriggerZone) {
-                    e.preventDefault();  // 仅阻止默认滚动行为，不阻止事件传播
-                }
-            };
-
-            // 使用 wheel 事件，在捕获阶段拦截，passive 必须为 false 才能调用 preventDefault
-            document.addEventListener('wheel', this.zoneWheelBlockHandler, { capture: true, passive: false });
-        }
-
-        /** 移除区域滚轮拦截 */
-        removeZoneWheelBlock() {
-            if (this.zoneWheelBlockHandler) {
-                document.removeEventListener('wheel', this.zoneWheelBlockHandler, { capture: true, passive: false });
-                this.zoneWheelBlockHandler = null;
-            }
-        }
-
         /** 设置滚轮监听 */
         setupWheelListener() {
             // 设置鼠标移动监听以检测是否在触发区域内
@@ -796,6 +755,10 @@
                     // 区域触发或按键触发即可
                     if (!inZone && !this.isTriggerKeyPressed) return;
                     if (e.target.closest('video')) return;
+                    
+                    // 阻止页面滚动
+                    e.preventDefault();
+                    
                     if (this.requireHoverOnVideo) {
                         if (this.video && this.video.matches(':hover')) {
                             const delta = e.deltaY > 0 ? -1 : 1;
@@ -814,6 +777,9 @@
 
                 // 模式3：直接触发（无需按键），但区域触发也有效
                 if (this.fullscreenMode === 3 || inZone) {
+                    // 阻止页面滚动
+                    e.preventDefault();
+                    
                     if (this.video && this.video.matches(':hover')) {
                         const delta = e.deltaY > 0 ? -1 : 1;
                         this.adjustVolume(delta);
@@ -824,6 +790,10 @@
                 // 模式2：需要按键触发
                 if (!this.isTriggerKeyPressed) return;
                 if (e.target.closest('video')) return;
+                
+                // 阻止页面滚动
+                e.preventDefault();
+                
                 if (this.requireHoverOnVideo) {
                     if (this.video && this.video.matches(':hover')) {
                         const delta = e.deltaY > 0 ? -1 : 1;
@@ -833,7 +803,7 @@
                     const delta = e.deltaY > 0 ? -1 : 1;
                     this.adjustVolume(delta);
                 }
-            }, { passive: true });
+            }, { passive: false });
         }
 
         /** 调节音量 */
@@ -849,20 +819,30 @@
             let displayVolume = newDisplayVolume;
 
             if (newDisplayVolume <= 1) {
-                // 回到普通音量范围
-                this.video.volume = Math.max(0, Math.min(1, newDisplayVolume));
+                // 回到普通音量范围，确保不小于0
+                const finalVolume = Math.max(0, newDisplayVolume);
+                this.video.volume = finalVolume;
                 if (CONFIG.enableVolumeBoost && this.gainNode) {
                     this.boostMultiplier = 1.0;
                     this.gainNode.gain.value = 1.0;
                 }
-                displayVolume = newDisplayVolume;
+                displayVolume = finalVolume;
             } else if (CONFIG.enableVolumeBoost && this.gainNode) {
                 // 超过100%，使用增益
                 this.video.volume = 1.0;
                 const newBoost = this.boostMultiplier + (direction * step);
-                this.boostMultiplier = Math.max(1.0, Math.min(CONFIG.maxVolumeBoost, newBoost));
-                this.gainNode.gain.value = this.boostMultiplier;
-                displayVolume = this.boostMultiplier;
+                
+                if (newBoost < 1.0) {
+                    // 增益已到最小值，继续减小则进入普通音量模式（不能小于0）
+                    displayVolume = Math.max(0, newBoost);
+                    this.video.volume = displayVolume;
+                    this.boostMultiplier = 1.0;
+                    this.gainNode.gain.value = 1.0;
+                } else {
+                    this.boostMultiplier = Math.max(1.0, Math.min(CONFIG.maxVolumeBoost, newBoost));
+                    this.gainNode.gain.value = this.boostMultiplier;
+                    displayVolume = this.boostMultiplier;
+                }
             }
 
             this.lastVolume = displayVolume;
@@ -963,8 +943,10 @@
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     overflow: hidden;
                     display: none;
+                    flex-direction: column;
+                    max-height: calc(100vh - 100px);
                 }
-                .bilibili-scroll-volume-settings.show { display: block; }
+                .bilibili-scroll-volume-settings.show { display: flex; }
                 .sv-settings-header {
                     padding: 16px 20px;
                     background: linear-gradient(135deg, #00d9ff, #00ff88);
@@ -976,17 +958,32 @@
                     align-items: center;
                     cursor: move;
                     user-select: none;
+                    flex-shrink: 0;
                 }
                 .sv-settings-close {
                     background: none;
                     border: none;
                     color: #fff;
-                    font-size: 20px;
+                    font-size: 22px;
                     cursor: pointer;
-                    padding: 0;
+                    padding: 6px 10px;
                     line-height: 1;
+                    border-radius: 6px;
+                    transition: background-color 0.3s ease;
                 }
-                .sv-settings-body { padding: 20px; }
+                .sv-settings-close:hover {
+                    background: rgba(255, 80, 80, 0.8);
+                }
+                .sv-settings-body { padding: 20px; overflow-y: auto; flex: 1; }
+                .sv-settings-footer {
+                    padding: 12px 20px;
+                    border-top: 1px solid #eee;
+                    display: flex;
+                    justify-content: flex-end;
+                    align-items: center;
+                    flex-shrink: 0;
+                    background: #fff;
+                }
                 .sv-setting-item {
                     display: flex;
                     justify-content: space-between;
@@ -1158,7 +1155,7 @@
                     width: 100%;
                     height: 6px;
                     border-radius: 3px;
-                    background: #e0e0e0;
+                    background: linear-gradient(to right, #00d9ff 0%, #00d9ff var(--progress, 50%), #4a4a4a var(--progress, 50%), #4a4a4a 100%);
                     outline: none;
                 }
                 .sv-slider::-webkit-slider-thumb {
@@ -1181,6 +1178,20 @@
                     background: #00d9ff;
                     cursor: pointer;
                     border: none;
+                }
+                .sv-slider::-moz-range-progress {
+                    background: #00d9ff;
+                    height: 6px;
+                    border-radius: 3px;
+                }
+                .sv-slider::-moz-range-track {
+                    background: #4a4a4a;
+                    height: 6px;
+                    border-radius: 3px;
+                }
+                .sv-editable-value {
+                    color: #7fdbff;
+                    font-weight: 500;
                 }
                 /* 下拉框样式 */
                 .sv-select-input {
@@ -1240,6 +1251,7 @@
                     background: rgba(0, 0, 0, 0.5);
                     z-index: 2147483643 !important;
                     display: none;
+                    pointer-events: none;  /* 允许点击事件穿透 */
                 }
                 .sv-zone-editor-overlay.show {
                     display: block;
@@ -1249,6 +1261,7 @@
                     border: 2px solid #00d9ff;
                     background: rgba(0, 217, 255, 0.1);
                     cursor: move;
+                    pointer-events: auto;  /* 编辑框接收事件 */
                 }
                 .sv-zone-editor-handle {
                     position: absolute;
@@ -1276,6 +1289,7 @@
                     display: flex;
                     gap: 16px;
                     z-index: 2147483645 !important;
+                    pointer-events: auto;  /* 按钮接收事件 */
                 }
                 .sv-zone-btn {
                     padding: 12px 32px;
@@ -1300,6 +1314,51 @@
                 }
                 .sv-zone-btn-save:hover {
                     background: #00b8d9;
+                }
+
+                /* 深色模式 */
+                .bilibili-scroll-volume-settings.sv-dark-mode {
+                    background: #1a1a1a;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-settings-header {
+                    background: linear-gradient(135deg, #2a2a2a, #1a1a1a);
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-settings-body {
+                    background: #1a1a1a;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-setting-item {
+                    border-bottom-color: #333;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-setting-label {
+                    color: #e0e0e0;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-setting-desc {
+                    color: #aaa;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-settings-footer {
+                    background: #1a1a1a;
+                    border-top-color: #333;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-settings-footer span {
+                    color: #aaa;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-key-btn {
+                    background: #e0e0e0;
+                    color: #333;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-key-btn:hover {
+                    background: #d0d0d0;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-select-input {
+                    background: #e0e0e0;
+                    color: #333;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-select-input:hover {
+                    background: #d0d0d0;
+                }
+                .bilibili-scroll-volume-settings.sv-dark-mode .sv-key-btn.sv-zone-btn-active {
+                    background: #00d9ff !important;
+                    color: #e8f8ff !important;
                 }
             `;
             document.head.appendChild(style);
@@ -1368,27 +1427,18 @@
                         </div>
                         <button class="sv-setting-btn sv-key-btn" id="sv-trigger-key-btn">空格</button>
                     </div>
-                    <div class="sv-setting-item">
-                        <div>
-                            <div class="sv-setting-label">音量调节</div>
-                            <div class="sv-setting-desc">每次滚轮调节的音量变化（1-100）</div>
+                    <div class="sv-setting-item" style="display: flex; align-items: center; gap: 12px;">
+                        <div style="flex-shrink: 0;">
+                            <div class="sv-setting-label">步长</div>
+                            <div class="sv-setting-desc">双击输入（1-100）</div>
                         </div>
-                        <div class="sv-slider-container">
-                            <input type="number" class="sv-number-input" id="sv-volume-step-input" min="1" max="100" value="5">
+                        <div class="sv-slider-container" style="flex-shrink: 0;">
+                            <span class="sv-editable-value" id="sv-volume-step-display" style="min-width: 35px; text-align: center; cursor: pointer;">5%</span>
                             <span class="sv-unit">%</span>
                         </div>
+                        <input type="range" class="sv-slider" id="sv-volume-step-slider" min="1" max="100" value="5" style="flex: 1;">
                     </div>
-                    <div class="sv-setting-item" style="flex-direction: column; align-items: flex-start; gap: 8px;">
-                        <div style="display: flex; justify-content: space-between; width: 100%;">
-                            <div>
-                                <div class="sv-setting-label">精细调节</div>
-                                <div class="sv-setting-desc">拖动滑块快速调节</div>
-                            </div>
-                            <span class="sv-slider-value" id="sv-volume-step-value">5%</span>
-                        </div>
-                        <input type="range" class="sv-slider" id="sv-volume-step-slider" min="1" max="100" value="5" style="width: 100%;">
-                    </div>
-                    <div class="sv-setting-item">
+                                        <div class="sv-setting-item">
                         <div>
                             <div class="sv-setting-label">必须鼠标在视频上</div>
                             <div class="sv-setting-desc">关闭后，页面任意位置均可触发</div>
@@ -1398,22 +1448,32 @@
                             <span class="sv-toggle-slider"></span>
                         </label>
                     </div>
-                    <div class="sv-setting-item" id="sv-zone-setting-item">
-                        <div>
+                    <div class="sv-setting-item" id="sv-zone-setting-item" style="flex-direction: column; align-items: flex-start; gap: 6px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
                             <div class="sv-setting-label">指定区域触发</div>
-                            <div class="sv-setting-desc">鼠标在该区域内时无需按键即可触发</div>
-                        </div>
-                        <div style="display: flex; align-items: center; gap: 8px;">
                             <label class="sv-toggle-switch">
                                 <input type="checkbox" id="sv-trigger-zone-toggle">
                                 <span class="sv-toggle-slider"></span>
                             </label>
+                        </div>
+                        <div class="sv-setting-desc">鼠标在该区域内时无需按键即可触发</div>
+                        <div style="display: flex; gap: 8px; justify-content: center; width: 100%;">
                             <button class="sv-setting-btn sv-key-btn" id="sv-edit-zone-btn" style="background: #e8f8ff; color: #00d9ff;">编辑区域</button>
                             <button class="sv-setting-btn sv-key-btn" id="sv-show-zone-btn" style="background: #e8f8ff; color: #00d9ff;">显示区域</button>
                         </div>
                     </div>
                 </div>
-            `;
+                <div class="sv-settings-footer">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-size: 13px; color: #666;">深色模式</span>
+                        <label class="sv-toggle-switch">
+                            <input type="checkbox" id="sv-dark-mode-toggle">
+                            <span class="sv-toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        `;
             document.body.appendChild(settingsPanel);
 
             // 按键监听遮罩
@@ -1509,40 +1569,80 @@
                 showToast(`全屏模式已调整为: ${modeText[value]}`);
             });
 
-            // 绑定滑块事件
-            const volumeStepSlider = document.getElementById('sv-volume-step-slider');
-            const volumeStepInput = document.getElementById('sv-volume-step-input');
-            const volumeStepValue = document.getElementById('sv-volume-step-value');
+            // 绑定步长编辑事件（双击打开输入框）
+            const volumeStepDisplay = document.getElementById('sv-volume-step-display');
+            let inputEl = null;
+            
+            volumeStepDisplay.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                const currentValue = parseInt(getVolumeStepPercent()) || 5;
+                
+                // 创建输入框
+                inputEl = document.createElement('input');
+                inputEl.type = 'number';
+                inputEl.className = 'sv-number-input';
+                inputEl.min = 1;
+                inputEl.max = 100;
+                inputEl.value = currentValue;
+                inputEl.style.cssText = 'width: 50px; padding: 2px 5px; border: 1px solid #00d9ff; border-radius: 4px; text-align: center; font-size: 14px;';
+                
+                // 替换显示元素
+                volumeStepDisplay.textContent = '';
+                volumeStepDisplay.appendChild(inputEl);
+                inputEl.focus();
+                inputEl.select();
+                
+                // 失焦或回车确认
+                const confirmInput = () => {
+                    let value = parseInt(inputEl.value) || 5;
+                    value = Math.max(1, Math.min(100, value));
+                    setVolumeStepPercent(value);
+                    this.volumeStepPercent = value;
+                    volumeStepDisplay.textContent = value + '%';
+                    showToast(`步长已调整为 ${value}%`);
+                };
+                
+                inputEl.addEventListener('blur', confirmInput);
+                inputEl.addEventListener('keydown', (ev) => {
+                    if (ev.key === 'Enter') {
+                        ev.preventDefault();
+                        inputEl.blur();
+                    } else if (ev.key === 'Escape') {
+                        volumeStepDisplay.textContent = currentValue + '%';
+                    }
+                });
+            });
 
-            // 滑块变化时同步输入框和显示
+            // 同步显示初始化
+            const volumeStepSlider = document.getElementById('sv-volume-step-slider');
+            const syncDisplayValue = () => {
+                const value = parseInt(getVolumeStepPercent()) || 5;
+                if (volumeStepDisplay) {
+                    volumeStepDisplay.textContent = value + '%';
+                }
+                if (volumeStepSlider) {
+                    volumeStepSlider.value = value;
+                    volumeStepSlider.style.setProperty('--progress', (value / 100) * 100 + '%');
+                }
+            };
+            syncDisplayValue();
+
+            // 滑块变化时同步
             volumeStepSlider.addEventListener('input', (e) => {
                 const value = parseInt(e.target.value);
-                volumeStepInput.value = value;
-                volumeStepValue.textContent = value + '%';
+                volumeStepDisplay.textContent = value + '%';
+                // 更新滑块背景进度
+                const progress = (value / 100) * 100;
+                volumeStepSlider.style.setProperty('--progress', progress + '%');
             });
             volumeStepSlider.addEventListener('change', (e) => {
                 const value = parseInt(e.target.value);
                 setVolumeStepPercent(value);
                 this.volumeStepPercent = value;
-                showToast(`音量调节已调整为 ${value}%`);
-            });
-
-            // 输入框变化时同步滑块和显示
-            volumeStepInput.addEventListener('input', (e) => {
-                let value = parseInt(e.target.value) || 1;
-                value = Math.max(1, Math.min(100, value));
-                volumeStepSlider.value = value;
-                volumeStepValue.textContent = value + '%';
-            });
-            volumeStepInput.addEventListener('change', (e) => {
-                let value = parseInt(e.target.value) || 5;
-                value = Math.max(1, Math.min(100, value));
-                volumeStepInput.value = value;
-                volumeStepSlider.value = value;
-                setVolumeStepPercent(value);
-                this.volumeStepPercent = value;
-                volumeStepValue.textContent = value + '%';
-                showToast(`音量调节已调整为 ${value}%`);
+                volumeStepDisplay.textContent = value + '%';
+                const progress = (value / 100) * 100;
+                volumeStepSlider.style.setProperty('--progress', progress + '%');
+                showToast(`步长已调整为 ${value}%`);
             });
 
             // 绑定开关事件
@@ -1566,6 +1666,17 @@
 
             // 绑定编辑区域按钮
             const editZoneBtn = document.getElementById('sv-edit-zone-btn');
+            const updateEditZoneBtnStyle = () => {
+                const isDarkMode = settingsPanel.classList.contains('sv-dark-mode');
+                if (isDarkMode) {
+                    editZoneBtn.style.background = '#00d9ff';
+                    editZoneBtn.style.color = '#111';
+                } else {
+                    editZoneBtn.style.background = '#e8f8ff';
+                    editZoneBtn.style.color = '#00d9ff';
+                }
+            };
+            updateEditZoneBtnStyle();
             editZoneBtn.addEventListener('click', () => {
                 this.startZoneEditing();
             });
@@ -1573,9 +1684,16 @@
             // 绑定显示区域按钮
             const showZoneBtn = document.getElementById('sv-show-zone-btn');
             const updateShowZoneBtn = () => {
+                const isDarkMode = settingsPanel.classList.contains('sv-dark-mode');
                 showZoneBtn.textContent = this.showTriggerZone ? '显示区域' : '隐藏区域';
-                showZoneBtn.style.background = this.showTriggerZone ? '#e8f8ff' : '#f0f0f0';
-                showZoneBtn.style.color = this.showTriggerZone ? '#00d9ff' : '#999';
+                if (isDarkMode) {
+                    // 深色模式下反转颜色
+                    showZoneBtn.style.background = this.showTriggerZone ? '#00d9ff' : '#3a3a3a';
+                    showZoneBtn.style.color = this.showTriggerZone ? '#111' : '#888';
+                } else {
+                    showZoneBtn.style.background = this.showTriggerZone ? '#e8f8ff' : '#f0f0f0';
+                    showZoneBtn.style.color = this.showTriggerZone ? '#00d9ff' : '#999';
+                }
             };
             updateShowZoneBtn();
             showZoneBtn.addEventListener('click', () => {
@@ -1584,6 +1702,31 @@
                 this.updateTriggerZoneElement();
                 updateShowZoneBtn();
                 showToast(this.showTriggerZone ? '已显示区域' : '已隐藏区域');
+            });
+
+            // 绑定深色模式开关
+            const darkModeToggle = document.getElementById('sv-dark-mode-toggle');
+            // 加载保存的设置
+            const savedDarkMode = GM_getValue('sv-dark-mode', false);
+            darkModeToggle.checked = savedDarkMode;
+            if (savedDarkMode) {
+                settingsPanel.classList.add('sv-dark-mode');
+            }
+            // 根据当前模式更新按钮样式
+            updateShowZoneBtn();
+            updateEditZoneBtnStyle();
+
+            darkModeToggle.addEventListener('change', (e) => {
+                const isDarkMode = e.target.checked;
+                if (isDarkMode) {
+                    settingsPanel.classList.add('sv-dark-mode');
+                } else {
+                    settingsPanel.classList.remove('sv-dark-mode');
+                }
+                GM_setValue('sv-dark-mode', isDarkMode);
+                updateShowZoneBtn();
+                updateEditZoneBtnStyle();
+                showToast(isDarkMode ? '已开启深色模式' : '已关闭深色模式');
             });
         }
 
