@@ -53,9 +53,9 @@
         return code;
     }
 
-    /** 获取当前存储的触发键，默认空格 */
+    /** 获取当前存储的触发键，默认左Shift */
     function getStoredTriggerKey() {
-        return GM_getValue('triggerKey', 'Space');
+        return GM_getValue('triggerKey', 'ShiftLeft');
     }
 
     /** 保存触发键 */
@@ -113,6 +113,16 @@
         GM_setValue('triggerZoneRect', rect);
     }
 
+    /** 获取显示区域开关 */
+    function getShowTriggerZone() {
+        return GM_getValue('showTriggerZone', true);
+    }
+
+    /** 保存显示区域开关 */
+    function setShowTriggerZone(value) {
+        GM_setValue('showTriggerZone', value);
+    }
+
     // ============ 全局状态 ============
     let isListeningForKey = false;
     let settingsPanel = null;
@@ -152,11 +162,12 @@
             this.fullscreenMode = getFullscreenMode();
             this.indicatorTimeout = null;
             this.triggerZoneEnabled = getTriggerZoneEnabled();
+            this.showTriggerZone = getShowTriggerZone();
             this.triggerZoneRect = getTriggerZoneRect();
             this.triggerZoneElement = null;
             this.isInTriggerZone = false;
             this.isEditingZone = false;
-            this.zoneWheelHandler = null;
+            this.zoneWheelBlockHandler = null;
 
             this.init();
         }
@@ -174,6 +185,7 @@
             this.volumeStepPercent = getVolumeStepPercent();
             this.fullscreenMode = getFullscreenMode();
             this.triggerZoneEnabled = getTriggerZoneEnabled();
+            this.showTriggerZone = getShowTriggerZone();
             this.triggerZoneRect = getTriggerZoneRect();
             this.updateTriggerZoneElement();
         }
@@ -186,6 +198,15 @@
             document.body.appendChild(zone);
             this.triggerZoneElement = zone;
             this.updateTriggerZoneElement();
+            
+            // 在触发区域上直接监听滚轮，阻止穿透并调节音量
+            zone.addEventListener('wheel', (e) => {
+                if (!this.isInTriggerZone) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const delta = e.deltaY > 0 ? -1 : 1;
+                this.adjustVolume(delta);
+            }, { passive: false });
         }
 
         /** 更新触发区域位置 */
@@ -201,8 +222,13 @@
                 zone.style.width = rect.width + '%';
                 zone.style.height = rect.height + '%';
                 zone.style.display = 'block';
+                // 显示时允许指针事件，让滚轮事件能被区域捕获
+                zone.style.pointerEvents = 'auto';
+                // 控制透明度
+                zone.style.opacity = this.showTriggerZone ? '' : '0';
             } else {
                 this.triggerZoneElement.style.display = 'none';
+                this.triggerZoneElement.style.pointerEvents = 'none';
             }
         }
 
@@ -251,6 +277,13 @@
                     box.appendChild(handle);
                 });
                 
+                // 添加四条边拖拽手柄
+                ['n', 's', 'e', 'w'].forEach(pos => {
+                    const handle = document.createElement('div');
+                    handle.className = 'sv-zone-editor-handle edge ' + pos;
+                    box.appendChild(handle);
+                });
+                
                 // 添加底部按钮栏
                 const buttonBar = document.createElement('div');
                 buttonBar.className = 'sv-zone-editor-buttons';
@@ -292,41 +325,92 @@
         setupZoneEditorEvents(box, overlay) {
             const handleMouseMove = (e) => {
                 const state = this.zoneEditorState;
-                const dx = ((e.clientX - state.startX) / window.innerWidth) * 100;
-                const dy = ((e.clientY - state.startY) / window.innerHeight) * 100;
+                
+                // 最小尺寸：100px x 100px
+                const minWidthPx = 100;
+                const minHeightPx = 100;
                 
                 if (state.isResizing) {
                     const rect = state.startRect;
                     const corner = state.resizeCorner;
                     
-                    // 缩放逻辑：只增大，不减小
-                    // nw: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
-                    // ne: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
-                    // sw: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
-                    // se: 向右拖增大宽度(dx>0)，向下拖增大高度(dy>0)
+                    // 转换为像素
+                    const boxWidthPx = (rect.width / 100) * window.innerWidth;
+                    const boxHeightPx = (rect.height / 100) * window.innerHeight;
                     
-                    // 向上拖动(n角)减小高度
-                    if (corner.includes('n') && dy < 0) {
-                        const newHeight = Math.max(5, rect.height + dy);
-                        box.style.height = newHeight + '%';
-                        // 不移动top，保持原位
+                    // 上边拖动（只增大，不减小）
+                    if (corner === 'n') {
+                        const dy =  e.clientY - state.startY; // 向上拖dy>0，向上缩小
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx - dy);
+                        const heightChangePx = boxHeightPx - newHeightPx;
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
+                        box.style.top = (rect.y + heightChangePx / window.innerHeight * 100) + '%';
                     }
-                    // 向下拖动(s角)增大高度
-                    if (corner.includes('s') && dy > 0) {
-                        box.style.height = Math.max(5, rect.height + dy) + '%';
+                    // 下边拖动
+                    else if (corner === 's') {
+                        const dy = e.clientY - state.startY; // 向下拖dy>0
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx + dy);
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
                     }
-                    // 向左拖动(w角)减小宽度
-                    if (corner.includes('w') && dx < 0) {
-                        const newWidth = Math.max(5, rect.width + dx);
-                        box.style.width = newWidth + '%';
-                        // 不移动left，保持原位
+                    // 左边拖动
+                    else if (corner === 'w') {
+                        const dx = e.clientX - state.startX; // 向左拖dx>0
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx - dx);
+                        const widthChangePx = boxWidthPx - newWidthPx;
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
+                        box.style.left = (rect.x + widthChangePx / window.innerWidth * 100) + '%';
                     }
-                    // 向右拖动(e角)增大宽度
-                    if (corner.includes('e') && dx > 0) {
-                        box.style.width = Math.max(5, rect.width + dx) + '%';
+                    // 右边拖动
+                    else if (corner === 'e') {
+                        const dx = e.clientX - state.startX; // 向右拖dx>0
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx + dx);
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
+                    }
+                    // 四角拖动（nw, ne, sw, se）
+                    else if (corner === 'nw') {
+                        const dy = e.clientY - state.startY;
+                        const dx = e.clientX - state.startX;
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx - dy);
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx - dx);
+                        const heightChangePx = boxHeightPx - newHeightPx;
+                        const widthChangePx = boxWidthPx - newWidthPx;
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
+                        box.style.top = (rect.y + heightChangePx / window.innerHeight * 100) + '%';
+                        box.style.left = (rect.x + widthChangePx / window.innerWidth * 100) + '%';
+                    }
+                    else if (corner === 'ne') {
+                        const dy = e.clientY - state.startY;
+                        const dx = e.clientX - state.startX;
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx - dy);
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx + dx);
+                        const heightChangePx = boxHeightPx - newHeightPx;
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
+                        box.style.top = (rect.y + heightChangePx / window.innerHeight * 100) + '%';
+                    }
+                    else if (corner === 'sw') {
+                        const dy = e.clientY - state.startY;
+                        const dx = e.clientX - state.startX;
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx + dy);
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx - dx);
+                        const widthChangePx = boxWidthPx - newWidthPx;
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
+                        box.style.left = (rect.x + widthChangePx / window.innerWidth * 100) + '%';
+                    }
+                    else if (corner === 'se') {
+                        const dy = e.clientY - state.startY;
+                        const dx = e.clientX - state.startX;
+                        const newHeightPx = Math.max(minHeightPx, boxHeightPx + dy);
+                        const newWidthPx = Math.max(minWidthPx, boxWidthPx + dx);
+                        box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
+                        box.style.width = (newWidthPx / window.innerWidth * 100) + '%';
                     }
                 } else if (state.isDragging) {
                     const rect = state.startRect;
+                    const dx = ((e.clientX - state.startX) / window.innerWidth) * 100;
+                    const dy = ((e.clientY - state.startY) / window.innerHeight) * 100;
                     box.style.left = Math.max(0, Math.min(100 - rect.width, rect.x + dx)) + '%';
                     box.style.top = Math.max(0, Math.min(100 - rect.height, rect.y + dy)) + '%';
                 }
@@ -384,16 +468,33 @@
                 document.addEventListener('mouseup', handleMouseUp, { once: true });
             });
             
-            // 处理角拖拽
+            // 处理角和边拖拽
             box.querySelectorAll('.sv-zone-editor-handle').forEach(handle => {
                 handle.addEventListener('mousedown', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
                     
+                    // 获取是哪个角或哪条边
+                    const classes = handle.classList;
+                    const isCorner = ['nw', 'ne', 'sw', 'se'].some(c => classes.contains(c));
+                    
+                    let resizeCorner = null;
+                    if (isCorner) {
+                        resizeCorner = ['nw', 'ne', 'sw', 'se'].find(c => classes.contains(c));
+                    } else if (classes.contains('n')) {
+                        resizeCorner = 'n';
+                    } else if (classes.contains('s')) {
+                        resizeCorner = 's';
+                    } else if (classes.contains('e')) {
+                        resizeCorner = 'e';
+                    } else if (classes.contains('w')) {
+                        resizeCorner = 'w';
+                    }
+                    
                     // 更新状态
                     this.zoneEditorState.isDragging = false;
                     this.zoneEditorState.isResizing = true;
-                    this.zoneEditorState.resizeCorner = handle.classList[1];
+                    this.zoneEditorState.resizeCorner = resizeCorner;
                     this.zoneEditorState.startX = e.clientX;
                     this.zoneEditorState.startY = e.clientY;
                     // 使用当前框体位置作为起点
@@ -603,33 +704,25 @@
                    y >= rect.y && y <= rect.y + rect.height;
         }
 
-        /** 设置区域内滚轮拦截 */
-        setupZoneWheelCapture() {
-            if (this.zoneWheelHandler) return;
-            
-            this.zoneWheelHandler = (e) => {
+        /** 区域内滚轮拦截（防止页面滚动穿透） */
+        setupZoneWheelBlock() {
+            if (this.zoneWheelBlockHandler) return;
+
+            this.zoneWheelBlockHandler = (e) => {
                 if (this.isInTriggerZone) {
-                    e.stopPropagation();
+                    e.preventDefault();  // 仅阻止默认滚动行为，不阻止事件传播
                 }
             };
-            
-            // 在区域元素上添加滚轮事件拦截
-            if (this.triggerZoneElement) {
-                this.triggerZoneElement.addEventListener('wheel', this.zoneWheelHandler, { passive: false });
-            }
-            
-            // 同时在document上拦截，防止冒泡
-            document.addEventListener('wheel', this.zoneWheelHandler, true);
+
+            // 使用 wheel 事件，在捕获阶段拦截，passive 必须为 false 才能调用 preventDefault
+            document.addEventListener('wheel', this.zoneWheelBlockHandler, { capture: true, passive: false });
         }
 
-        /** 移除滚轮拦截 */
-        removeZoneWheelCapture() {
-            if (this.zoneWheelHandler) {
-                if (this.triggerZoneElement) {
-                    this.triggerZoneElement.removeEventListener('wheel', this.zoneWheelHandler);
-                }
-                document.removeEventListener('wheel', this.zoneWheelHandler, true);
-                this.zoneWheelHandler = null;
+        /** 移除区域滚轮拦截 */
+        removeZoneWheelBlock() {
+            if (this.zoneWheelBlockHandler) {
+                document.removeEventListener('wheel', this.zoneWheelBlockHandler, { capture: true, passive: false });
+                this.zoneWheelBlockHandler = null;
             }
         }
 
@@ -643,13 +736,8 @@
                 if (this.triggerZoneElement) {
                     if (this.isInTriggerZone) {
                         this.triggerZoneElement.classList.add('highlight');
-                        this.triggerZoneElement.classList.add('active-zone');
-                        // 添加滚轮拦截
-                        this.setupZoneWheelCapture();
                     } else {
                         this.triggerZoneElement.classList.remove('highlight');
-                        this.triggerZoneElement.classList.remove('active-zone');
-                        this.removeZoneWheelCapture();
                     }
                 }
                 
@@ -886,6 +974,8 @@
                     display: flex;
                     justify-content: space-between;
                     align-items: center;
+                    cursor: move;
+                    user-select: none;
                 }
                 .sv-settings-close {
                     background: none;
@@ -1171,6 +1261,11 @@
                 .sv-zone-editor-handle.ne { top: -6px; right: -6px; cursor: ne-resize; }
                 .sv-zone-editor-handle.sw { bottom: -6px; left: -6px; cursor: sw-resize; }
                 .sv-zone-editor-handle.se { bottom: -6px; right: -6px; cursor: se-resize; }
+                /* 四条边拖拽手柄 */
+                .sv-zone-editor-handle.edge.n { top: -4px; left: 50%; transform: translateX(-50%); width: 24px; height: 8px; border-radius: 4px; cursor: n-resize; }
+                .sv-zone-editor-handle.edge.s { bottom: -4px; left: 50%; transform: translateX(-50%); width: 24px; height: 8px; border-radius: 4px; cursor: s-resize; }
+                .sv-zone-editor-handle.edge.e { right: -4px; top: 50%; transform: translateY(-50%); width: 8px; height: 24px; border-radius: 4px; cursor: e-resize; }
+                .sv-zone-editor-handle.edge.w { left: -4px; top: 50%; transform: translateY(-50%); width: 8px; height: 24px; border-radius: 4px; cursor: w-resize; }
 
                 /* 区域编辑按钮样式 */
                 .sv-zone-editor-buttons {
@@ -1314,6 +1409,7 @@
                                 <span class="sv-toggle-slider"></span>
                             </label>
                             <button class="sv-setting-btn sv-key-btn" id="sv-edit-zone-btn" style="background: #e8f8ff; color: #00d9ff;">编辑区域</button>
+                            <button class="sv-setting-btn sv-key-btn" id="sv-show-zone-btn" style="background: #e8f8ff; color: #00d9ff;">显示区域</button>
                         </div>
                     </div>
                 </div>
@@ -1363,6 +1459,39 @@
             const closeBtn = settingsPanel.querySelector('.sv-settings-close');
             closeBtn.addEventListener('click', () => {
                 settingsPanel.classList.remove('show');
+            });
+
+            // 设置面板拖拽功能
+            const settingsHeader = settingsPanel.querySelector('.sv-settings-header');
+            let isDragging = false;
+            let dragOffsetX = 0;
+            let dragOffsetY = 0;
+
+            settingsHeader.addEventListener('mousedown', (e) => {
+                // 只响应左键
+                if (e.button !== 0) return;
+                isDragging = true;
+                const rect = settingsPanel.getBoundingClientRect();
+                dragOffsetX = e.clientX - rect.left;
+                dragOffsetY = e.clientY - rect.top;
+                settingsPanel.style.transition = 'none';
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                const x = e.clientX - dragOffsetX;
+                const y = e.clientY - dragOffsetY;
+                // 限制在视口内
+                const maxX = window.innerWidth - settingsPanel.offsetWidth;
+                const maxY = window.innerHeight - settingsPanel.offsetHeight;
+                settingsPanel.style.left = Math.max(0, Math.min(maxX, x)) + 'px';
+                settingsPanel.style.top = Math.max(0, Math.min(maxY, y)) + 'px';
+                settingsPanel.style.right = 'auto';
+            });
+
+            document.addEventListener('mouseup', () => {
+                isDragging = false;
+                settingsPanel.style.transition = '';
             });
 
             const keyBtn = document.getElementById('sv-trigger-key-btn');
@@ -1439,6 +1568,22 @@
             const editZoneBtn = document.getElementById('sv-edit-zone-btn');
             editZoneBtn.addEventListener('click', () => {
                 this.startZoneEditing();
+            });
+
+            // 绑定显示区域按钮
+            const showZoneBtn = document.getElementById('sv-show-zone-btn');
+            const updateShowZoneBtn = () => {
+                showZoneBtn.textContent = this.showTriggerZone ? '显示区域' : '隐藏区域';
+                showZoneBtn.style.background = this.showTriggerZone ? '#e8f8ff' : '#f0f0f0';
+                showZoneBtn.style.color = this.showTriggerZone ? '#00d9ff' : '#999';
+            };
+            updateShowZoneBtn();
+            showZoneBtn.addEventListener('click', () => {
+                this.showTriggerZone = !this.showTriggerZone;
+                setShowTriggerZone(this.showTriggerZone);
+                this.updateTriggerZoneElement();
+                updateShowZoneBtn();
+                showToast(this.showTriggerZone ? '已显示区域' : '已隐藏区域');
             });
         }
 
