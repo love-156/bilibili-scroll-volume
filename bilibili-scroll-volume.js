@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.7.2
+// @version      1.7.3
 // @description  按住V键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
@@ -35,8 +35,8 @@
             'ControlRight': '右Ctrl',
             'AltLeft': '左Alt',
             'AltRight': '右Alt',
-            'MetaLeft': '左Meta',
-            'MetaRight': '右Meta',
+            'MetaLeft': '左Win',
+            'MetaRight': '右Win',
             'Tab': 'Tab',
             'CapsLock': 'CapsLock',
             'Enter': '回车',
@@ -201,11 +201,11 @@
         /** 更新触发区域位置 */
         updateTriggerZoneElement() {
             if (!this.triggerZoneElement) return;
-            
+
             if (this.triggerZoneEnabled && this.triggerZoneRect) {
                 const rect = this.triggerZoneRect;
                 const zone = this.triggerZoneElement;
-                
+
                 zone.style.left = rect.x + '%';
                 zone.style.top = rect.y + '%';
                 zone.style.width = rect.width + '%';
@@ -224,22 +224,22 @@
             if (!this.triggerZoneEnabled || !this.triggerZoneRect) {
                 return false;
             }
-            
+
             const x = (e.clientX / window.innerWidth) * 100;
             const y = (e.clientY / window.innerHeight) * 100;
             const rect = this.triggerZoneRect;
-            
+
             return x >= rect.x && x <= rect.x + rect.width &&
-                   y >= rect.y && y <= rect.y + rect.height;
+                y >= rect.y && y <= rect.y + rect.height;
         }
 
         /** 开始编辑触发区域 */
         startZoneEditing() {
             this.isEditingZone = true;
-            
+
             // 隐藏设置面板
             settingsPanel.classList.remove('show');
-            
+
             // 获取或创建编辑遮罩
             let overlay = document.getElementById('sv-zone-editor-overlay');
             if (!overlay) {
@@ -248,7 +248,7 @@
                 overlay.className = 'sv-zone-editor-overlay';
                 document.body.appendChild(overlay);
             }
-            
+
             // 获取或创建编辑框
             let box = document.getElementById('sv-zone-editor-box');
             if (!box) {
@@ -256,21 +256,21 @@
                 box.id = 'sv-zone-editor-box';
                 box.className = 'sv-zone-editor-box';
                 overlay.appendChild(box);
-                
+
                 // 添加四个角拖拽手柄
                 ['nw', 'ne', 'sw', 'se'].forEach(pos => {
                     const handle = document.createElement('div');
                     handle.className = 'sv-zone-editor-handle ' + pos;
                     box.appendChild(handle);
                 });
-                
+
                 // 添加四条边拖拽手柄
                 ['n', 's', 'e', 'w'].forEach(pos => {
                     const handle = document.createElement('div');
                     handle.className = 'sv-zone-editor-handle edge ' + pos;
                     box.appendChild(handle);
                 });
-                
+
                 // 添加底部按钮栏
                 const buttonBar = document.createElement('div');
                 buttonBar.className = 'sv-zone-editor-buttons';
@@ -280,21 +280,21 @@
                 `;
                 overlay.appendChild(buttonBar);
             }
-            
+
             // 设置初始区域
             const rect = this.triggerZoneRect || { x: 10, y: 10, width: 80, height: 80 };
             box.style.left = rect.x + '%';
             box.style.top = rect.y + '%';
             box.style.width = rect.width + '%';
             box.style.height = rect.height + '%';
-            
+
             overlay.classList.add('show');
-            
+
             // 编辑模式下隐藏原有的触发区域元素
             if (this.triggerZoneElement) {
                 this.triggerZoneElement.style.display = 'none';
             }
-            
+
             // 设置拖拽状态
             this.zoneEditorState = {
                 isDragging: false,
@@ -304,7 +304,7 @@
                 startY: 0,
                 startRect: { ...rect }
             };
-            
+
             this.setupZoneEditorEvents(box, overlay);
         }
 
@@ -312,22 +312,22 @@
         setupZoneEditorEvents(box, overlay) {
             const handleMouseMove = (e) => {
                 const state = this.zoneEditorState;
-                
+
                 // 最小尺寸：100px x 100px
                 const minWidthPx = 100;
                 const minHeightPx = 100;
-                
+
                 if (state.isResizing) {
                     const rect = state.startRect;
                     const corner = state.resizeCorner;
-                    
+
                     // 转换为像素
                     const boxWidthPx = (rect.width / 100) * window.innerWidth;
                     const boxHeightPx = (rect.height / 100) * window.innerHeight;
-                    
+
                     // 上边拖动（只增大，不减小）
                     if (corner === 'n') {
-                        const dy =  e.clientY - state.startY; // 向上拖dy>0，向上缩小
+                        const dy = e.clientY - state.startY; // 向上拖dy>0，向上缩小
                         const newHeightPx = Math.max(minHeightPx, boxHeightPx - dy);
                         const heightChangePx = boxHeightPx - newHeightPx;
                         box.style.height = (newHeightPx / window.innerHeight * 100) + '%';
@@ -402,7 +402,7 @@
                     box.style.top = Math.max(0, Math.min(100 - rect.height, rect.y + dy)) + '%';
                 }
             };
-            
+
             const handleMouseUp = () => {
                 document.removeEventListener('mousemove', handleMouseMove);
                 document.removeEventListener('mouseup', handleMouseUp);
@@ -416,27 +416,27 @@
                     };
                 }
             };
-            
+
             // 绑定取消按钮
             const cancelBtn = overlay.querySelector('.sv-zone-btn-cancel');
             cancelBtn.addEventListener('click', () => {
                 this.finishZoneEditing(false);
                 showToast('已取消编辑');
             });
-            
+
             // 绑定保存按钮
             const saveBtn = overlay.querySelector('.sv-zone-btn-save');
             saveBtn.addEventListener('click', () => {
                 this.finishZoneEditing(true);
             });
-            
+
             // 处理框拖拽
             box.addEventListener('mousedown', (e) => {
                 if (e.target.classList.contains('sv-zone-editor-handle')) return;
-                
+
                 e.preventDefault();
                 e.stopPropagation();
-                
+
                 // 更新状态
                 this.zoneEditorState.isDragging = true;
                 this.zoneEditorState.isResizing = false;
@@ -450,21 +450,21 @@
                     width: parseFloat(box.style.width),
                     height: parseFloat(box.style.height)
                 };
-                
+
                 document.addEventListener('mousemove', handleMouseMove);
                 document.addEventListener('mouseup', handleMouseUp, { once: true });
             });
-            
+
             // 处理角和边拖拽
             box.querySelectorAll('.sv-zone-editor-handle').forEach(handle => {
                 handle.addEventListener('mousedown', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    
+
                     // 获取是哪个角或哪条边
                     const classes = handle.classList;
                     const isCorner = ['nw', 'ne', 'sw', 'se'].some(c => classes.contains(c));
-                    
+
                     let resizeCorner = null;
                     if (isCorner) {
                         resizeCorner = ['nw', 'ne', 'sw', 'se'].find(c => classes.contains(c));
@@ -477,7 +477,7 @@
                     } else if (classes.contains('w')) {
                         resizeCorner = 'w';
                     }
-                    
+
                     // 更新状态
                     this.zoneEditorState.isDragging = false;
                     this.zoneEditorState.isResizing = true;
@@ -491,12 +491,12 @@
                         width: parseFloat(box.style.width),
                         height: parseFloat(box.style.height)
                     };
-                    
+
                     document.addEventListener('mousemove', handleMouseMove);
                     document.addEventListener('mouseup', handleMouseUp, { once: true });
                 });
             });
-            
+
         }
 
         /** 完成区域编辑 */
@@ -504,16 +504,16 @@
             this.isEditingZone = false;
             const overlay = document.getElementById('sv-zone-editor-overlay');
             const box = document.getElementById('sv-zone-editor-box');
-            
+
             if (overlay) {
                 overlay.classList.remove('show');
             }
-            
+
             // 恢复原有触发区域的显示
             if (this.triggerZoneElement) {
                 this.updateTriggerZoneElement();
             }
-            
+
             if (save && box) {
                 // 保存区域
                 const newRect = {
@@ -527,7 +527,7 @@
                 this.updateTriggerZoneElement();
                 showToast('触发区域已保存');
             }
-            
+
             this.zoneEditorState = null;
         }
 
@@ -676,13 +676,13 @@
             if (!this.triggerZoneEnabled || !this.triggerZoneRect) {
                 return false;
             }
-            
+
             const x = (e.clientX / window.innerWidth) * 100;
             const y = (e.clientY / window.innerHeight) * 100;
             const rect = this.triggerZoneRect;
-            
+
             return x >= rect.x && x <= rect.x + rect.width &&
-                   y >= rect.y && y <= rect.y + rect.height;
+                y >= rect.y && y <= rect.y + rect.height;
         }
 
         /** 设置滚轮监听 */
@@ -691,7 +691,7 @@
             document.addEventListener('mousemove', (e) => {
                 const wasInZone = this.isInTriggerZone;
                 this.isInTriggerZone = this.checkTriggerZone(e);
-                
+
                 if (this.triggerZoneElement) {
                     if (this.isInTriggerZone) {
                         this.triggerZoneElement.classList.add('highlight');
@@ -699,7 +699,7 @@
                         this.triggerZoneElement.classList.remove('highlight');
                     }
                 }
-                
+
                 // 更新视觉反馈
                 if (wasInZone !== this.isInTriggerZone) {
                     if (this.isInTriggerZone) {
@@ -709,7 +709,7 @@
                     }
                 }
             });
-            
+
             this.video.addEventListener('wheel', (e) => {
                 const inFullscreen = this.checkFullscreenState();
                 const inZone = this.isInTriggerZone;
@@ -755,10 +755,10 @@
                     // 区域触发或按键触发即可
                     if (!inZone && !this.isTriggerKeyPressed) return;
                     if (e.target.closest('video')) return;
-                    
+
                     // 阻止页面滚动
                     e.preventDefault();
-                    
+
                     if (this.requireHoverOnVideo) {
                         if (this.video && this.video.matches(':hover')) {
                             const delta = e.deltaY > 0 ? -1 : 1;
@@ -779,7 +779,7 @@
                 if (this.fullscreenMode === 3 || inZone) {
                     // 阻止页面滚动
                     e.preventDefault();
-                    
+
                     if (this.video && this.video.matches(':hover')) {
                         const delta = e.deltaY > 0 ? -1 : 1;
                         this.adjustVolume(delta);
@@ -790,10 +790,10 @@
                 // 模式2：需要按键触发
                 if (!this.isTriggerKeyPressed) return;
                 if (e.target.closest('video')) return;
-                
+
                 // 阻止页面滚动
                 e.preventDefault();
-                
+
                 if (this.requireHoverOnVideo) {
                     if (this.video && this.video.matches(':hover')) {
                         const delta = e.deltaY > 0 ? -1 : 1;
@@ -831,7 +831,7 @@
                 // 超过100%，使用增益
                 this.video.volume = 1.0;
                 const newBoost = this.boostMultiplier + (direction * step);
-                
+
                 if (newBoost < 1.0) {
                     // 增益已到最小值，继续减小则进入普通音量模式（不能小于0）
                     displayVolume = Math.max(0, newBoost);
@@ -1433,7 +1433,7 @@
                             <div class="sv-setting-desc">双击输入（1-100）</div>
                         </div>
                         <div class="sv-slider-container" style="flex-shrink: 0;">
-                            <span class="sv-editable-value" id="sv-volume-step-display" style="min-width: 35px; text-align: center; cursor: pointer;">5%</span>
+                            <span class="sv-editable-value" id="sv-volume-step-display" style="min-width: 35px; text-align: center; cursor: pointer;">5</span>
                             <span class="sv-unit">%</span>
                         </div>
                         <input type="range" class="sv-slider" id="sv-volume-step-slider" min="1" max="100" value="5" style="flex: 1;">
@@ -1572,11 +1572,11 @@
             // 绑定步长编辑事件（双击打开输入框）
             const volumeStepDisplay = document.getElementById('sv-volume-step-display');
             let inputEl = null;
-            
+
             volumeStepDisplay.addEventListener('dblclick', (e) => {
                 e.stopPropagation();
                 const currentValue = parseInt(getVolumeStepPercent()) || 5;
-                
+
                 // 创建输入框
                 inputEl = document.createElement('input');
                 inputEl.type = 'number';
@@ -1585,30 +1585,30 @@
                 inputEl.max = 100;
                 inputEl.value = currentValue;
                 inputEl.style.cssText = 'width: 50px; padding: 2px 5px; border: 1px solid #00d9ff; border-radius: 4px; text-align: center; font-size: 14px;';
-                
+
                 // 替换显示元素
                 volumeStepDisplay.textContent = '';
                 volumeStepDisplay.appendChild(inputEl);
                 inputEl.focus();
                 inputEl.select();
-                
+
                 // 失焦或回车确认
                 const confirmInput = () => {
                     let value = parseInt(inputEl.value) || 5;
                     value = Math.max(1, Math.min(100, value));
                     setVolumeStepPercent(value);
                     this.volumeStepPercent = value;
-                    volumeStepDisplay.textContent = value + '%';
+                    volumeStepDisplay.textContent = value;
                     showToast(`步长已调整为 ${value}%`);
                 };
-                
+
                 inputEl.addEventListener('blur', confirmInput);
                 inputEl.addEventListener('keydown', (ev) => {
                     if (ev.key === 'Enter') {
                         ev.preventDefault();
                         inputEl.blur();
                     } else if (ev.key === 'Escape') {
-                        volumeStepDisplay.textContent = currentValue + '%';
+                        volumeStepDisplay.textContent = currentValue;
                     }
                 });
             });
@@ -1618,11 +1618,11 @@
             const syncDisplayValue = () => {
                 const value = parseInt(getVolumeStepPercent()) || 5;
                 if (volumeStepDisplay) {
-                    volumeStepDisplay.textContent = value + '%';
+                    volumeStepDisplay.textContent = value;
                 }
                 if (volumeStepSlider) {
                     volumeStepSlider.value = value;
-                    volumeStepSlider.style.setProperty('--progress', (value / 100) * 100 + '%');
+                    volumeStepSlider.style.setProperty('--progress', (value / 100) * 100);
                 }
             };
             syncDisplayValue();
@@ -1630,18 +1630,18 @@
             // 滑块变化时同步
             volumeStepSlider.addEventListener('input', (e) => {
                 const value = parseInt(e.target.value);
-                volumeStepDisplay.textContent = value + '%';
+                volumeStepDisplay.textContent = value;
                 // 更新滑块背景进度
                 const progress = (value / 100) * 100;
-                volumeStepSlider.style.setProperty('--progress', progress + '%');
+                volumeStepSlider.style.setProperty('--progress', progress);
             });
             volumeStepSlider.addEventListener('change', (e) => {
                 const value = parseInt(e.target.value);
                 setVolumeStepPercent(value);
                 this.volumeStepPercent = value;
-                volumeStepDisplay.textContent = value + '%';
+                volumeStepDisplay.textContent = value;
                 const progress = (value / 100) * 100;
-                volumeStepSlider.style.setProperty('--progress', progress + '%');
+                volumeStepSlider.style.setProperty('--progress', progress);
                 showToast(`步长已调整为 ${value}%`);
             });
 
@@ -1823,7 +1823,7 @@
             input.value = volumeStep;
         }
         if (sliderValue) {
-            sliderValue.textContent = volumeStep + '%';
+            sliderValue.textContent = volumeStep;
         }
         if (fullscreenSelect) {
             fullscreenSelect.value = fullscreenMode;
