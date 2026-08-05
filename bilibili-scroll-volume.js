@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.7.3
+// @version      1.7.5
 // @description  按住V键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
@@ -150,7 +150,9 @@
             this.volumeIndicator = null;
             this.volumeIndicatorFull = null;
             this.audioContext = null;
+            this.mediaSourceNode = null;
             this.gainNode = null;
+            this.audioVideo = null;
             this.lastVolume = 0;
             this.boostMultiplier = 1.0;
             this.rafId = null;
@@ -166,6 +168,13 @@
             this.isInTriggerZone = false;
             this.isEditingZone = false;
             this.zoneWheelBlockHandler = null;
+            this.indicatorObserver = null;
+            this.indicatorSyncTimer = null;
+            this.indicatorPollTimer = null;
+            this.mediaLifecycleHandler = null;
+            this.wheelListenersInitialized = false;
+            this.boundWheelVideo = null;
+            this.videoWheelHandler = null;
 
             this.init();
         }
@@ -533,31 +542,174 @@
 
         /** 检测是否处于视频全屏或网页全屏状态 */
         checkFullscreenState() {
-            // 通过 bpx-player-container 的 data-screen 属性判断
-            const playerContainer = document.querySelector('.bpx-player-container');
-            if (playerContainer) {
-                const screen = playerContainer.getAttribute('data-screen');
-                // data-screen="web" 表示网页全屏
-                // data-screen="full" 表示视频全屏
-                if (screen === 'web' || screen === 'full') {
-                    return true;
-                }
-            }
-            return false;
+            const playerContainer = this.getPlayerContainer();
+            const screen = playerContainer?.getAttribute('data-screen');
+            return screen === 'web' || screen === 'full' || Boolean(document.fullscreenElement);
         }
 
-        /** 尝试将全屏指示器添加到播放器容器 */
-        tryAppendIndicatorToPlayer() {
-            const playerContainer = document.querySelector('.bpx-player-container');
-            if (playerContainer && this.volumeIndicatorFull) {
-                // 检查是否已经添加过
-                if (!playerContainer.contains(this.volumeIndicatorFull)) {
-                    playerContainer.appendChild(this.volumeIndicatorFull);
+        /** 判断页面中的 video 是否确实存在可用媒体；暂停状态不影响判断 */
+        isPlayableVideo(video) {
+            if (!video || !video.isConnected || video.error) return false;
+            if (video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) return false;
+
+            // 只存在 video 标签或 src 属性还不代表有视频可播放。
+            // 必须已经拿到媒体元数据及有效时长；paused 不参与判断。
+            const hasMetadata = video.readyState >= HTMLMediaElement.HAVE_METADATA;
+            const hasValidDuration = video.duration === Infinity ||
+                (Number.isFinite(video.duration) && video.duration > 0);
+
+            return Boolean(video.currentSrc) && hasMetadata && hasValidDuration;
+        }
+
+        /** 查找主播放器中可用的视频，不以 paused 属性作为判断条件 */
+        findPlayableVideo() {
+            const containerSelectors = [
+                '.bpx-player-container',
+                '#bilibili-player',
+                '.bilibili-player-video',
+                '.player-container'
+            ];
+
+            for (const selector of containerSelectors) {
+                const containers = document.querySelectorAll(selector);
+                for (const container of containers) {
+                    const videos = container.querySelectorAll('video');
+                    for (const video of videos) {
+                        if (this.isPlayableVideo(video)) return video;
+                    }
                 }
-            } else {
-                // 播放器还没加载，稍后重试
-                setTimeout(() => this.tryAppendIndicatorToPlayer(), 500);
             }
+            return null;
+        }
+
+        /** 获取当前视频对应的主播放器容器 */
+        getPlayerContainer(video = this.video) {
+            const selector = '.bpx-player-container, #bilibili-player, .bilibili-player-video, .player-container';
+            return video?.closest(selector) || document.querySelector(selector);
+        }
+
+        /** 创建唯一的音量指示器节点 */
+        createVolumeIndicatorElement() {
+            const indicator = document.createElement('div');
+            indicator.id = 'scroll-volume-indicator';
+            indicator.dataset.revision = '1';
+            indicator.innerHTML = `
+                <div class="scroll-volume-icon">
+                    <svg viewBox="0 0 24 24" width="24" height="24">
+                        <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+                    </svg>
+                </div>
+                <div class="scroll-volume-bar-container">
+                    <div class="scroll-volume-bar"></div>
+                    <div class="scroll-volume-bar-bg"></div>
+                </div>
+                <div class="scroll-volume-value">100%</div>
+            `;
+            return indicator;
+        }
+
+        /** 删除所有音量指示器，避免无视频或 SPA 切换时残留 */
+        removeVolumeIndicators() {
+            document.querySelectorAll('#scroll-volume-indicator, #scroll-volume-indicator-full')
+                .forEach(indicator => indicator.remove());
+            this.volumeIndicator = null;
+            this.volumeIndicatorFull = null;
+            clearTimeout(this.indicatorTimeout);
+        }
+
+        /** 根据当前是否存在可用视频，同步指示器的创建、挂载和唯一性 */
+        syncVolumeIndicatorLifecycle() {
+            if (!CONFIG.showVolumeIndicator) {
+                this.removeVolumeIndicators();
+                return;
+            }
+
+            const video = this.findPlayableVideo();
+            const playerContainer = this.getPlayerContainer(video);
+
+            // 没有可用视频或没有播放器容器时直接移除；视频暂停不会进入该分支。
+            if (!video || !playerContainer) {
+                this.removeVolumeIndicators();
+                if (this.boundWheelVideo && this.videoWheelHandler) {
+                    this.boundWheelVideo.removeEventListener('wheel', this.videoWheelHandler);
+                }
+                this.boundWheelVideo = null;
+                this.video = null;
+                if (!this.audioVideo?.isConnected) {
+                    this.resetVolumeBoost();
+                }
+                return;
+            }
+
+            const indicators = [...document.querySelectorAll('#scroll-volume-indicator')];
+            let indicator = this.volumeIndicator?.isConnected
+                ? this.volumeIndicator
+                : indicators[0];
+
+            if (!indicator) {
+                indicator = this.createVolumeIndicatorElement();
+            }
+
+            // 始终挂载到当前 bpx 播放器容器，网页全屏和原生全屏复用同一个节点。
+            if (indicator.parentElement !== playerContainer) {
+                playerContainer.appendChild(indicator);
+            }
+
+            // 清理旧版全屏节点和所有重复节点，只保留当前这一份。
+            document.querySelectorAll('#scroll-volume-indicator-full').forEach(node => node.remove());
+            document.querySelectorAll('#scroll-volume-indicator').forEach(node => {
+                if (node !== indicator) node.remove();
+            });
+
+            const videoChanged = this.video !== video;
+            this.video = video;
+            this.volumeIndicator = indicator;
+            this.volumeIndicatorFull = null;
+
+            if (videoChanged) {
+                // 新视频不能继承上一个视频的显示音量和增益状态。
+                this.lastVolume = video.volume;
+                this.boostMultiplier = 1.0;
+
+                if (this.wheelListenersInitialized) {
+                    this.bindWheelListenerToVideo();
+                    this.setupVolumeBoost();
+                }
+            }
+        }
+
+        /** 监听 B 站 SPA 页面和播放器 DOM 变化 */
+        startVolumeIndicatorLifecycleObserver() {
+            const scheduleSync = () => {
+                clearTimeout(this.indicatorSyncTimer);
+                this.indicatorSyncTimer = setTimeout(() => {
+                    this.syncVolumeIndicatorLifecycle();
+                }, 100);
+            };
+
+            this.indicatorObserver?.disconnect();
+            this.indicatorObserver = new MutationObserver(scheduleSync);
+            this.indicatorObserver.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['src', 'data-screen']
+            });
+
+            if (this.mediaLifecycleHandler) {
+                ['loadedmetadata', 'durationchange', 'emptied', 'error']
+                    .forEach(type => document.removeEventListener(type, this.mediaLifecycleHandler, true));
+            }
+            this.mediaLifecycleHandler = scheduleSync;
+            ['loadedmetadata', 'durationchange', 'emptied', 'error']
+                .forEach(type => document.addEventListener(type, this.mediaLifecycleHandler, true));
+
+            clearInterval(this.indicatorPollTimer);
+            this.indicatorPollTimer = setInterval(() => {
+                this.syncVolumeIndicatorLifecycle();
+            }, 1000);
+
+            this.syncVolumeIndicatorLifecycle();
         }
 
         /** 获取当前音量步进值（0-1范围） */
@@ -567,34 +719,22 @@
 
         /** 初始化 */
         init() {
-            this.waitForVideoReady();
             this.setupKeyboardListeners();
             this.createVolumeIndicator();
+            this.startVolumeIndicatorLifecycleObserver();
+            this.waitForVideoReady();
         }
 
-        /** 等待视频元素加载 */
+        /** 等待首个可用视频元素加载 */
         waitForVideoReady() {
-            const findVideo = () => {
-                const selectors = [
-                    'video',
-                    '.bilibili-player-video video',
-                    '.bpx-player-video-area video',
-                    '#bilibili-player video',
-                    '.player-container video'
-                ];
-                for (const selector of selectors) {
-                    const video = document.querySelector(selector);
-                    if (video && video.duration > 0) return video;
-                }
-                return null;
-            };
-
             const tryInit = () => {
-                this.video = findVideo();
-                if (this.video) {
+                const video = this.findPlayableVideo();
+                if (video) {
+                    this.video = video;
                     this.setupVolumeBoost();
                     this.setupWheelListener();
                     this.createTriggerZoneElement();
+                    this.syncVolumeIndicatorLifecycle();
                 } else {
                     setTimeout(tryInit, 500);
                 }
@@ -603,18 +743,42 @@
             tryInit();
         }
 
+        /** 释放旧视频的 Web Audio 连接 */
+        resetVolumeBoost() {
+            try {
+                this.mediaSourceNode?.disconnect();
+                this.gainNode?.disconnect();
+                if (this.audioContext && this.audioContext.state !== 'closed') {
+                    this.audioContext.close().catch(() => {});
+                }
+            } catch (e) {
+                // 节点可能已经由浏览器断开，无需继续处理。
+            }
+
+            this.audioContext = null;
+            this.mediaSourceNode = null;
+            this.gainNode = null;
+            this.audioVideo = null;
+            this.boostMultiplier = 1.0;
+        }
+
         /** 设置音量增益 (Web Audio API) */
         setupVolumeBoost() {
-            if (!CONFIG.enableVolumeBoost) return;
+            if (!CONFIG.enableVolumeBoost || !this.video) return;
+            if (this.audioVideo === this.video && this.gainNode) return;
+
+            this.resetVolumeBoost();
             try {
                 this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = this.audioContext.createMediaElementSource(this.video);
+                this.mediaSourceNode = this.audioContext.createMediaElementSource(this.video);
                 this.gainNode = this.audioContext.createGain();
-                source.connect(this.gainNode);
+                this.mediaSourceNode.connect(this.gainNode);
                 this.gainNode.connect(this.audioContext.destination);
                 this.gainNode.gain.value = 1.0;
+                this.audioVideo = this.video;
             } catch (e) {
-                CONFIG.enableVolumeBoost = false;
+                this.resetVolumeBoost();
+                console.warn('[滚轮音量] 当前视频无法启用音量增益:', e);
             }
         }
 
@@ -685,8 +849,52 @@
                 y >= rect.y && y <= rect.y + rect.height;
         }
 
+        /** 将滚轮处理器绑定到当前视频；视频被 SPA 替换时会自动迁移 */
+        bindWheelListenerToVideo() {
+            if (this.boundWheelVideo && this.videoWheelHandler) {
+                this.boundWheelVideo.removeEventListener('wheel', this.videoWheelHandler);
+            }
+
+            this.boundWheelVideo = this.video;
+            if (!this.boundWheelVideo) return;
+
+            if (!this.videoWheelHandler) {
+                this.videoWheelHandler = (e) => {
+                    const inFullscreen = this.checkFullscreenState();
+                    const inZone = this.isInTriggerZone;
+
+                    if (!inFullscreen) {
+                        if (!inZone && !this.isTriggerKeyPressed) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.adjustVolume(e.deltaY > 0 ? -1 : 1);
+                        return;
+                    }
+
+                    if (this.fullscreenMode === 1) return;
+                    if (this.fullscreenMode === 3 || inZone) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        this.adjustVolume(e.deltaY > 0 ? -1 : 1);
+                        return;
+                    }
+
+                    if (!this.isTriggerKeyPressed) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.adjustVolume(e.deltaY > 0 ? -1 : 1);
+                };
+            }
+
+            this.boundWheelVideo.addEventListener('wheel', this.videoWheelHandler, { passive: false });
+        }
+
         /** 设置滚轮监听 */
         setupWheelListener() {
+            this.bindWheelListenerToVideo();
+            if (this.wheelListenersInitialized) return;
+            this.wheelListenersInitialized = true;
+
             // 设置鼠标移动监听以检测是否在触发区域内
             document.addEventListener('mousemove', (e) => {
                 const wasInZone = this.isInTriggerZone;
@@ -709,42 +917,6 @@
                     }
                 }
             });
-
-            this.video.addEventListener('wheel', (e) => {
-                const inFullscreen = this.checkFullscreenState();
-                const inZone = this.isInTriggerZone;
-
-                // 非全屏状态
-                if (!inFullscreen) {
-                    // 区域触发或按键触发即可
-                    if (!inZone && !this.isTriggerKeyPressed) return;
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const delta = e.deltaY > 0 ? -1 : 1;
-                    this.adjustVolume(delta);
-                    return;
-                }
-
-                // 全屏状态：根据模式决定
-                // 模式1：禁用
-                if (this.fullscreenMode === 1) return;
-
-                // 模式3：直接触发（无需按键），但区域触发也有效
-                if (this.fullscreenMode === 3 || inZone) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const delta = e.deltaY > 0 ? -1 : 1;
-                    this.adjustVolume(delta);
-                    return;
-                }
-
-                // 模式2：需要按键触发
-                if (!this.isTriggerKeyPressed) return;
-                e.preventDefault();
-                e.stopPropagation();
-                const delta = e.deltaY > 0 ? -1 : 1;
-                this.adjustVolume(delta);
-            }, { passive: false });
 
             document.addEventListener('wheel', (e) => {
                 const inFullscreen = this.checkFullscreenState();
@@ -808,7 +980,10 @@
 
         /** 调节音量 */
         adjustVolume(direction) {
-            if (!this.video) return;
+            if (!this.isPlayableVideo(this.video)) {
+                this.syncVolumeIndicatorLifecycle();
+                return;
+            }
             if (this.rafId) cancelAnimationFrame(this.rafId);
 
             const step = this.getVolumeStep();
@@ -843,6 +1018,11 @@
                     this.gainNode.gain.value = this.boostMultiplier;
                     displayVolume = this.boostMultiplier;
                 }
+            } else {
+                // Web Audio 不可用时不能显示虚假的 100% 以上音量。
+                this.video.volume = 1.0;
+                this.boostMultiplier = 1.0;
+                displayVolume = 1.0;
             }
 
             this.lastVolume = displayVolume;
@@ -851,9 +1031,11 @@
         }
 
         triggerVolumeChange() {
+            const targetVideo = this.video;
             this.rafId = requestAnimationFrame(() => {
+                if (!targetVideo?.isConnected) return;
                 const event = new Event('volumechange', { bubbles: true });
-                this.video.dispatchEvent(event);
+                targetVideo.dispatchEvent(event);
             });
         }
 
@@ -864,37 +1046,11 @@
             const style = document.createElement('style');
             style.textContent = `
                 #scroll-volume-indicator {
-                    position: fixed !important;
-                    top: 50% !important;
-                    left: 50% !important;
-                    transform: translate(-50%, -50%) !important;
-                    display: flex !important;
-                    align-items: center;
-                    gap: 12px;
-                    padding: 16px 24px;
-                    background: rgba(0, 0, 0, 0.85) !important;
-                    border-radius: 12px;
-                    color: #fff;
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                    font-size: 14px;
-                    z-index: 2147483647 !important;
-                    opacity: 0 !important;
-                    pointer-events: none !important;
-                    transition: opacity 0.2s ease;
-                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-                    /* 隔离 stacking context，确保全屏模式下 z-index 生效 */
-                    isolation: isolate !important;
-                }
-                #scroll-volume-indicator.show {
-                    opacity: 1 !important;
-                }
-                /* 全屏音量指示器（放在播放器容器内） */
-                #scroll-volume-indicator-full {
                     position: absolute !important;
                     top: 50% !important;
                     left: 50% !important;
                     transform: translate(-50%, -50%) !important;
-                    display: flex !important;
+                    display: none !important;
                     align-items: center;
                     gap: 12px;
                     padding: 16px 24px;
@@ -904,13 +1060,12 @@
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     font-size: 14px;
                     z-index: 2147483647 !important;
-                    opacity: 0 !important;
                     pointer-events: none !important;
-                    transition: opacity 0.2s ease;
                     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                    isolation: isolate !important;
                 }
-                #scroll-volume-indicator-full.show {
-                    opacity: 1 !important;
+                #scroll-volume-indicator.show {
+                    display: flex !important;
                 }
                 .scroll-volume-icon { display: flex !important; color: #00d9ff; }
                 .scroll-volume-bar-container { position: relative; width: 120px; height: 6px; }
@@ -1363,42 +1518,8 @@
             `;
             document.head.appendChild(style);
 
-            // 音量指示器
-            const indicator = document.createElement('div');
-            indicator.id = 'scroll-volume-indicator';
-            indicator.innerHTML = `
-                <div class="scroll-volume-icon">
-                    <svg viewBox="0 0 24 24" width="24" height="24">
-                        <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
-                    </svg>
-                </div>
-                <div class="scroll-volume-bar-container">
-                    <div class="scroll-volume-bar"></div>
-                    <div class="scroll-volume-bar-bg"></div>
-                </div>
-                <div class="scroll-volume-value">100%</div>
-            `;
-            document.body.appendChild(indicator);
-
-            // 全屏音量指示器（放在播放器容器内）
-            const indicatorFull = document.createElement('div');
-            indicatorFull.id = 'scroll-volume-indicator-full';
-            indicatorFull.innerHTML = `
-                <div class="scroll-volume-icon">
-                    <svg viewBox="0 0 24 24" width="24" height="24">
-                        <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
-                    </svg>
-                </div>
-                <div class="scroll-volume-bar-container">
-                    <div class="scroll-volume-bar"></div>
-                    <div class="scroll-volume-bar-bg"></div>
-                </div>
-                <div class="scroll-volume-value">100%</div>
-            `;
-
-            // 等待播放器加载后，将其添加到播放器容器内
-            this.volumeIndicatorFull = indicatorFull;
-            this.tryAppendIndicatorToPlayer();
+            // 音量指示器由 syncVolumeIndicatorLifecycle() 按视频状态动态创建。
+            // 无可用视频时不向播放器容器注入任何指示器。
 
             // 设置面板
             settingsPanel = document.createElement('div');
@@ -1494,8 +1615,6 @@
             toast.id = 'sv-toast';
             document.body.appendChild(toast);
 
-            this.volumeIndicator = indicator;
-
             // 初始化全屏状态监听
             this.initFullscreenListener();
 
@@ -1507,6 +1626,7 @@
         initFullscreenListener() {
             const updateFullscreenState = () => {
                 this.isFullscreen = this.checkFullscreenState();
+                this.syncVolumeIndicatorLifecycle();
             };
 
             document.addEventListener('fullscreenchange', updateFullscreenState);
@@ -1733,15 +1853,15 @@
         updateVolumeIndicator(volume) {
             if (!CONFIG.showVolumeIndicator) return;
 
+            // 音量变化前再次同步，确保 SPA 切换后拿到当前播放器中的唯一节点。
+            this.syncVolumeIndicatorLifecycle();
+            const indicator = this.volumeIndicator;
+            if (!indicator || !indicator.isConnected) return;
+
             const percentage = Math.round(volume * 100);
-            const inFullscreen = this.checkFullscreenState();
-
-            // 根据全屏状态选择指示器
-            const currentIndicator = inFullscreen ? this.volumeIndicatorFull : this.volumeIndicator;
-            if (!currentIndicator) return;
-
-            const bar = currentIndicator.querySelector('.scroll-volume-bar');
-            const valueEl = currentIndicator.querySelector('.scroll-volume-value');
+            const bar = indicator.querySelector('.scroll-volume-bar');
+            const valueEl = indicator.querySelector('.scroll-volume-value');
+            if (!bar || !valueEl) return;
 
             bar.style.width = `${Math.min(100, percentage)}%`;
             valueEl.textContent = `${percentage}%`;
@@ -1754,23 +1874,11 @@
                 bar.style.background = 'linear-gradient(90deg, #00d9ff, #00ff88)';
             }
 
-            // 全屏模式：显示内嵌指示器，隐藏全局指示器
-            // 普通模式：显示全局指示器，隐藏内嵌指示器
-            if (inFullscreen) {
-                this.volumeIndicator.classList.remove('show');
-                currentIndicator.classList.add('show');
-            } else {
-                if (this.volumeIndicatorFull) {
-                    this.volumeIndicatorFull.classList.remove('show');
-                }
-                this.volumeIndicator.classList.add('show');
-            }
-
+            indicator.classList.add('show');
             clearTimeout(this.indicatorTimeout);
             this.indicatorTimeout = setTimeout(() => {
-                this.volumeIndicator.classList.remove('show');
-                if (this.volumeIndicatorFull) {
-                    this.volumeIndicatorFull.classList.remove('show');
+                if (indicator.isConnected) {
+                    indicator.classList.remove('show');
                 }
             }, CONFIG.indicatorDuration);
         }
