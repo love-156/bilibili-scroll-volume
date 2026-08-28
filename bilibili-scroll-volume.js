@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 滚轮音量控制
 // @namespace    https://github.com/love-156/bilibili-scroll-volume
-// @version      1.7.5
-// @description  按住V键 + 鼠标滚轮调节B站视频音量，支持手动输入音量调节值，支持全屏模式三挡开关，支持指定区域触发
+// @version      1.8.3
+// @description  鼠标滚轮调节B站视频音量，支持全屏、指定区域和可滚轮控制的自定义画中画窗口
 // @author       love_156
 // @match        *://*.bilibili.com/video/*
 // @match        *://bilibili.com/video/*
@@ -153,6 +153,7 @@
             this.mediaSourceNode = null;
             this.gainNode = null;
             this.audioVideo = null;
+            this.audioNodes = new WeakMap();
             this.lastVolume = 0;
             this.boostMultiplier = 1.0;
             this.rafId = null;
@@ -168,13 +169,23 @@
             this.isInTriggerZone = false;
             this.isEditingZone = false;
             this.zoneWheelBlockHandler = null;
-            this.indicatorObserver = null;
             this.indicatorSyncTimer = null;
-            this.indicatorPollTimer = null;
+            this.noVideoCleanupTimer = null;
             this.mediaLifecycleHandler = null;
+            this.routeChangeHandler = null;
+            this.navigationHandler = null;
+            this.recommendationClickHandler = null;
+            this.routeSyncTimers = [];
+            this.lastVideoSource = '';
             this.wheelListenersInitialized = false;
             this.boundWheelVideo = null;
             this.videoWheelHandler = null;
+            this.documentPipWindow = null;
+            this.documentPipVideo = null;
+            this.documentPipSourceVideo = null;
+            this.documentPipVolumeBar = null;
+            this.documentPipVolumeValue = null;
+            this.documentPipHideTimer = null;
 
             this.init();
         }
@@ -202,6 +213,8 @@
             const zone = document.createElement('div');
             zone.id = 'sv-trigger-zone';
             zone.className = 'sv-trigger-zone';
+            zone.setAttribute('aria-hidden', 'true');
+            zone.style.pointerEvents = 'none';
             document.body.appendChild(zone);
             this.triggerZoneElement = zone;
             this.updateTriggerZoneElement();
@@ -211,9 +224,12 @@
         updateTriggerZoneElement() {
             if (!this.triggerZoneElement) return;
 
+            const zone = this.triggerZoneElement;
+            // 触发区域只负责视觉提示，命中检测由坐标计算完成；任何状态下都不能遮挡网页点击。
+            zone.style.pointerEvents = 'none';
+
             if (this.triggerZoneEnabled && this.triggerZoneRect) {
                 const rect = this.triggerZoneRect;
-                const zone = this.triggerZoneElement;
 
                 zone.style.left = rect.x + '%';
                 zone.style.top = rect.y + '%';
@@ -547,9 +563,23 @@
             return screen === 'web' || screen === 'full' || Boolean(document.fullscreenElement);
         }
 
-        /** 判断页面中的 video 是否确实存在可用媒体；暂停状态不影响判断 */
+        /** 判断 video 是否属于 B站主播放器，排除右侧推荐卡片的悬停预览视频 */
+        isMainPlayerVideo(video) {
+            if (!video?.isConnected) return false;
+            if (video.closest('.recommend-list-v1, .recommend-list, .rec-list, .video-page-card-small, .framepreview-box, .bili-video-card')) {
+                return false;
+            }
+
+            return Boolean(video.closest(
+                '#bilibili-player .bpx-player-video-area, ' +
+                '.bpx-player-container .bpx-player-video-area, ' +
+                '.bilibili-player-video'
+            ));
+        }
+
+        /** 判断页面中的主播放器 video 是否确实存在可用媒体；暂停状态不影响判断 */
         isPlayableVideo(video) {
-            if (!video || !video.isConnected || video.error) return false;
+            if (!this.isMainPlayerVideo(video) || video.error) return false;
             if (video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) return false;
 
             // 只存在 video 标签或 src 属性还不代表有视频可播放。
@@ -561,31 +591,49 @@
             return Boolean(video.currentSrc) && hasMetadata && hasValidDuration;
         }
 
+        /** 判断视频是否仍是页面中可见的主播放器 */
+        isVisibleVideo(video) {
+            if (!video?.isConnected) return false;
+            const rect = video.getBoundingClientRect();
+            const style = getComputedStyle(video);
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                rect.width > 0 && rect.height > 0;
+        }
+
         /** 查找主播放器中可用的视频，不以 paused 属性作为判断条件 */
         findPlayableVideo() {
-            const containerSelectors = [
-                '.bpx-player-container',
-                '#bilibili-player',
-                '.bilibili-player-video',
-                '.player-container'
-            ];
+            // 绝大多数同步都发生在同一个可见 video 上，优先复用缓存避免全页面扫描。
+            if (this.isPlayableVideo(this.video) && this.isVisibleVideo(this.video)) return this.video;
 
-            for (const selector of containerSelectors) {
-                const containers = document.querySelectorAll(selector);
-                for (const container of containers) {
-                    const videos = container.querySelectorAll('video');
-                    for (const video of videos) {
-                        if (this.isPlayableVideo(video)) return video;
-                    }
+            const selector = [
+                '#bilibili-player .bpx-player-video-wrap > video',
+                '#bilibili-player .bpx-player-video-area video',
+                '.bpx-player-container .bpx-player-video-wrap > video',
+                '.bpx-player-container .bpx-player-video-area video',
+                '.bilibili-player-video video'
+            ].join(', ');
+            const videos = document.querySelectorAll(selector);
+
+            // 自动换集时页面可能暂时保留隐藏的旧 video，优先选择可见且面积最大的项。
+            let bestVideo = null;
+            let bestArea = -1;
+            for (const video of videos) {
+                if (!this.isPlayableVideo(video)) continue;
+                const rect = video.getBoundingClientRect();
+                const area = this.isVisibleVideo(video) ? rect.width * rect.height : 0;
+                if (area > bestArea) {
+                    bestArea = area;
+                    bestVideo = video;
                 }
             }
-            return null;
+            return bestArea > 0 ? bestVideo : null;
         }
 
         /** 获取当前视频对应的主播放器容器 */
         getPlayerContainer(video = this.video) {
-            const selector = '.bpx-player-container, #bilibili-player, .bilibili-player-video, .player-container';
-            return video?.closest(selector) || document.querySelector(selector);
+            const selector = '.bpx-player-container, #bilibili-player, .bilibili-player-video';
+            return video?.closest(selector) || this.volumeIndicator?.parentElement?.closest(selector) ||
+                document.querySelector('#bilibili-player .bpx-player-container, #bilibili-player, .bpx-player-container');
         }
 
         /** 创建唯一的音量指示器节点 */
@@ -627,19 +675,39 @@
             const video = this.findPlayableVideo();
             const playerContainer = this.getPlayerContainer(video);
 
-            // 没有可用视频或没有播放器容器时直接移除；视频暂停不会进入该分支。
+            // 自动换集时 video 会有短暂的无元数据窗口，延迟清理避免反复拆建节点和音频链。
             if (!video || !playerContainer) {
-                this.removeVolumeIndicators();
-                if (this.boundWheelVideo && this.videoWheelHandler) {
-                    this.boundWheelVideo.removeEventListener('wheel', this.videoWheelHandler);
-                }
-                this.boundWheelVideo = null;
-                this.video = null;
-                if (!this.audioVideo?.isConnected) {
-                    this.resetVolumeBoost();
+                if (!this.noVideoCleanupTimer) {
+                    this.noVideoCleanupTimer = setTimeout(() => {
+                        this.noVideoCleanupTimer = null;
+                        if (this.findPlayableVideo()) {
+                            this.syncVolumeIndicatorLifecycle();
+                            return;
+                        }
+
+                        this.removeVolumeIndicators();
+                        if (this.boundWheelVideo && this.videoWheelHandler) {
+                            this.boundWheelVideo.removeEventListener('wheel', this.videoWheelHandler);
+                        }
+                        this.boundWheelVideo = null;
+                        this.video = null;
+                        this.lastVideoSource = '';
+                        if (this.documentPipWindow && !this.documentPipWindow.closed) {
+                            this.documentPipWindow.close();
+                        }
+                        // createMediaElementSource 会永久接管元素音频；同一 video 仍连接时只复位增益，
+                        // 只有元素已移除时才断开链路，避免 SPA 换源后 100% 以下无声。
+                        if (this.audioVideo?.isConnected && this.gainNode) {
+                            this.resetVolumeBoost();
+                        } else if (this.audioVideo) {
+                            this.detachVolumeBoost(this.audioVideo);
+                        }
+                    }, 1200);
                 }
                 return;
             }
+            clearTimeout(this.noVideoCleanupTimer);
+            this.noVideoCleanupTimer = null;
 
             const indicators = [...document.querySelectorAll('#scroll-volume-indicator')];
             let indicator = this.volumeIndicator?.isConnected
@@ -661,60 +729,284 @@
                 if (node !== indicator) node.remove();
             });
 
-            const videoChanged = this.video !== video;
+            const currentSource = video.currentSrc || video.src || '';
+            const videoElementChanged = this.video !== video;
+            const videoSourceChanged = this.lastVideoSource !== currentSource;
             this.video = video;
+            this.lastVideoSource = currentSource;
             this.volumeIndicator = indicator;
             this.volumeIndicatorFull = null;
 
-            if (videoChanged) {
-                // 新视频不能继承上一个视频的显示音量和增益状态。
+            if (videoElementChanged || videoSourceChanged) {
+                // 新视频不能继承上一视频的显示音量和增益状态。
                 this.lastVolume = video.volume;
                 this.boostMultiplier = 1.0;
 
-                if (this.wheelListenersInitialized) {
-                    this.bindWheelListenerToVideo();
-                    this.setupVolumeBoost();
+                if (videoElementChanged) {
+                    if (this.audioVideo && this.audioVideo !== video) {
+                        this.detachVolumeBoost(this.audioVideo);
+                    }
+                    // 切回曾被 Web Audio 接管的 video 时，即使当前音量不超过 100% 也要恢复输出链。
+                    if (this.audioNodes.has(video)) {
+                        this.reconnectVolumeBoost(video);
+                    }
+                    if (this.wheelListenersInitialized) {
+                        this.bindWheelListenerToVideo();
+                    }
+                }
+                // 同一 video 仅更换 currentSrc 时保持音频链连接，只将增益复位。
+                if (!videoElementChanged && videoSourceChanged && this.audioVideo === video && this.gainNode) {
+                    this.resetVolumeBoost();
+                }
+                if (this.documentPipWindow && !this.documentPipWindow.closed &&
+                    !this.attachVideoToDocumentPictureInPicture(video)) {
+                    this.documentPipWindow.close();
+                    showToast('视频已切换，请重新打开滚轮画中画');
                 }
             }
         }
 
-        /** 监听 B 站 SPA 页面和播放器 DOM 变化 */
+        /** SPA 路由切换时释放悬停状态，并分阶段重新识别主播放器 */
+        scheduleRouteSync() {
+            this.isTriggerKeyPressed = false;
+            this.isInTriggerZone = false;
+            document.body.classList.remove('scroll-volume-active');
+            this.triggerZoneElement?.classList.remove('highlight');
+            this.volumeIndicator?.classList.remove('show');
+
+            this.routeSyncTimers.forEach(timer => clearTimeout(timer));
+            this.routeSyncTimers = [150, 600, 1500].map(delay => setTimeout(() => {
+                this.syncVolumeIndicatorLifecycle();
+            }, delay));
+        }
+
+        /** 监听主视频媒体生命周期；忽略推荐卡片预览视频，避免悬停或点击时干扰主播放器 */
         startVolumeIndicatorLifecycleObserver() {
-            const scheduleSync = () => {
+            const scheduleSync = (event) => {
+                if (event?.target instanceof HTMLVideoElement && !this.isMainPlayerVideo(event.target)) return;
                 clearTimeout(this.indicatorSyncTimer);
                 this.indicatorSyncTimer = setTimeout(() => {
                     this.syncVolumeIndicatorLifecycle();
-                }, 100);
+                }, 120);
             };
 
-            this.indicatorObserver?.disconnect();
-            this.indicatorObserver = new MutationObserver(scheduleSync);
-            this.indicatorObserver.observe(document.documentElement, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['src', 'data-screen']
-            });
-
             if (this.mediaLifecycleHandler) {
-                ['loadedmetadata', 'durationchange', 'emptied', 'error']
+                ['loadedmetadata', 'durationchange', 'emptied', 'error', 'canplay']
                     .forEach(type => document.removeEventListener(type, this.mediaLifecycleHandler, true));
             }
             this.mediaLifecycleHandler = scheduleSync;
-            ['loadedmetadata', 'durationchange', 'emptied', 'error']
+            ['loadedmetadata', 'durationchange', 'emptied', 'error', 'canplay']
                 .forEach(type => document.addEventListener(type, this.mediaLifecycleHandler, true));
 
-            clearInterval(this.indicatorPollTimer);
-            this.indicatorPollTimer = setInterval(() => {
-                this.syncVolumeIndicatorLifecycle();
-            }, 1000);
+            // B站为 SPA：覆盖前进/后退、哈希变化、Tampermonkey URL 变化和 Navigation API。
+            if (this.routeChangeHandler) {
+                window.removeEventListener('popstate', this.routeChangeHandler);
+                window.removeEventListener('hashchange', this.routeChangeHandler);
+                window.removeEventListener('urlchange', this.routeChangeHandler);
+            }
+            this.routeChangeHandler = () => this.scheduleRouteSync();
+            window.addEventListener('popstate', this.routeChangeHandler);
+            window.addEventListener('hashchange', this.routeChangeHandler);
+            window.addEventListener('urlchange', this.routeChangeHandler);
 
+            if (this.navigationHandler && window.navigation) {
+                window.navigation.removeEventListener('navigate', this.navigationHandler);
+            }
+            this.navigationHandler = () => this.scheduleRouteSync();
+            window.navigation?.addEventListener('navigate', this.navigationHandler);
+
+            if (this.recommendationClickHandler) {
+                document.removeEventListener('click', this.recommendationClickHandler, true);
+            }
+            this.recommendationClickHandler = (event) => {
+                if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+                    return;
+                }
+                const target = event.target instanceof Element ? event.target : null;
+                const link = target?.closest(
+                    '.recommend-list-v1 a[href*="/video/"], ' +
+                    '.recommend-list a[href*="/video/"], ' +
+                    '.rec-list a[href*="/video/"]'
+                );
+                if (link) this.scheduleRouteSync();
+            };
+            // 只观察点击，不阻止默认行为和事件传播，保证推荐视频链接正常跳转。
+            document.addEventListener('click', this.recommendationClickHandler, true);
             this.syncVolumeIndicatorLifecycle();
         }
 
         /** 获取当前音量步进值（0-1范围） */
         getVolumeStep() {
             return this.volumeStepPercent / 100;
+        }
+
+        /** 更新设置面板中的画中画按钮状态 */
+        updateDocumentPipButton() {
+            const button = document.getElementById('sv-document-pip-btn');
+            if (!button) return;
+            const isOpen = Boolean(this.documentPipWindow && !this.documentPipWindow.closed);
+            button.textContent = isOpen ? '关闭滚轮画中画' : '打开滚轮画中画';
+        }
+
+        /** 清理自定义画中画窗口引用 */
+        cleanupDocumentPictureInPicture() {
+            clearTimeout(this.documentPipHideTimer);
+            if (this.documentPipVideo) {
+                this.documentPipVideo.pause();
+                this.documentPipVideo.srcObject?.getTracks().forEach(track => track.stop());
+                this.documentPipVideo.srcObject = null;
+            }
+            this.documentPipWindow = null;
+            this.documentPipVideo = null;
+            this.documentPipSourceVideo = null;
+            this.documentPipVolumeBar = null;
+            this.documentPipVolumeValue = null;
+            this.updateDocumentPipButton();
+        }
+
+        /** 将当前视频画面接入 Document Picture-in-Picture 窗口 */
+        attachVideoToDocumentPictureInPicture(video) {
+            if (!video || !this.documentPipVideo) return false;
+            const captureStream = video.captureStream || video.mozCaptureStream;
+            if (typeof captureStream !== 'function') return false;
+
+            try {
+                const stream = captureStream.call(video);
+                if (!stream || stream.getVideoTracks().length === 0) return false;
+                this.documentPipVideo.srcObject?.getTracks().forEach(track => track.stop());
+                this.documentPipVideo.srcObject = stream;
+                this.documentPipVideo.muted = true;
+                this.documentPipVideo.play().catch(() => {});
+                this.documentPipSourceVideo = video;
+                return true;
+            } catch (error) {
+                console.warn('[滚轮音量] 无法捕获当前视频画面:', error);
+                return false;
+            }
+        }
+
+        /** 在自定义画中画窗口中显示当前音量 */
+        updateDocumentPipVolumeIndicator(volume) {
+            if (!this.documentPipWindow || this.documentPipWindow.closed ||
+                !this.documentPipVolumeBar || !this.documentPipVolumeValue) return;
+
+            const percentage = Math.round(volume * 100);
+            this.documentPipVolumeBar.style.width = `${Math.min(100, percentage)}%`;
+            this.documentPipVolumeValue.textContent = `${percentage}%`;
+            this.documentPipVolumeValue.classList.toggle('boosted', percentage > 100);
+
+            const indicator = this.documentPipVolumeValue.closest('.sv-pip-volume-indicator');
+            indicator?.classList.add('show');
+            clearTimeout(this.documentPipHideTimer);
+            this.documentPipHideTimer = setTimeout(() => {
+                indicator?.classList.remove('show');
+            }, CONFIG.indicatorDuration);
+        }
+
+        /** 打开可接收滚轮事件的自定义画中画窗口 */
+        async openDocumentPictureInPicture() {
+            if (!window.documentPictureInPicture?.requestWindow) {
+                showToast('当前 Chrome 不支持可滚轮画中画');
+                return;
+            }
+            if (document.pictureInPictureElement) {
+                showToast('请先关闭 Chrome 原生画中画，再打开滚轮画中画');
+                return;
+            }
+
+            const video = this.findPlayableVideo();
+            if (!video) {
+                showToast('当前没有可播放的视频');
+                return;
+            }
+
+            try {
+                const pipWindow = await window.documentPictureInPicture.requestWindow({
+                    width: 480,
+                    height: 270
+                });
+                this.documentPipWindow = pipWindow;
+
+                const pipDocument = pipWindow.document;
+                pipDocument.title = 'Bilibili 滚轮画中画';
+                const style = pipDocument.createElement('style');
+                style.textContent = `
+                    * { box-sizing: border-box; }
+                    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
+                    .sv-pip-container { position: relative; width: 100%; height: 100%; background: #000; }
+                    .sv-pip-video { width: 100%; height: 100%; object-fit: contain; display: block; }
+                    .sv-pip-volume-indicator {
+                        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+                        display: none; align-items: center; gap: 10px; min-width: 190px;
+                        padding: 12px 16px; border-radius: 10px; color: #fff;
+                        background: rgba(0, 0, 0, 0.82); font: 600 14px system-ui, sans-serif;
+                        pointer-events: none;
+                    }
+                    .sv-pip-volume-indicator.show { display: flex; }
+                    .sv-pip-volume-track { position: relative; flex: 1; height: 6px; border-radius: 3px; background: #4a4a4a; overflow: hidden; }
+                    .sv-pip-volume-bar { width: 0; height: 100%; border-radius: 3px; background: linear-gradient(90deg, #00d9ff, #00ff88); }
+                    .sv-pip-volume-value { min-width: 44px; text-align: right; }
+                    .sv-pip-volume-value.boosted { color: #ff6b6b; }
+                    .sv-pip-hint {
+                        position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+                        padding: 5px 10px; border-radius: 6px; color: #ddd;
+                        background: rgba(0, 0, 0, 0.55); font: 12px system-ui, sans-serif;
+                        pointer-events: none; opacity: 0.8; white-space: nowrap;
+                    }
+                `;
+                pipDocument.head.appendChild(style);
+
+                const container = pipDocument.createElement('div');
+                container.className = 'sv-pip-container';
+                container.innerHTML = `
+                    <video class="sv-pip-video" autoplay muted playsinline></video>
+                    <div class="sv-pip-volume-indicator">
+                        <div class="sv-pip-volume-track"><div class="sv-pip-volume-bar"></div></div>
+                        <div class="sv-pip-volume-value">${Math.round(this.lastVolume * 100)}%</div>
+                    </div>
+                    <div class="sv-pip-hint">鼠标滚轮调节音量</div>
+                `;
+                pipDocument.body.appendChild(container);
+
+                this.documentPipVideo = container.querySelector('.sv-pip-video');
+                this.documentPipVolumeBar = container.querySelector('.sv-pip-volume-bar');
+                this.documentPipVolumeValue = container.querySelector('.sv-pip-volume-value');
+
+                if (!this.attachVideoToDocumentPictureInPicture(video)) {
+                    pipWindow.close();
+                    this.cleanupDocumentPictureInPicture();
+                    showToast('当前视频无法创建可滚轮画中画');
+                    return;
+                }
+
+                pipDocument.addEventListener('wheel', (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.adjustVolume(event.deltaY > 0 ? -1 : 1);
+                }, { passive: false });
+
+                pipWindow.addEventListener('pagehide', () => {
+                    this.cleanupDocumentPictureInPicture();
+                }, { once: true });
+
+                this.updateDocumentPipButton();
+                showToast('已打开滚轮画中画');
+            } catch (error) {
+                this.cleanupDocumentPictureInPicture();
+                if (error?.name !== 'NotAllowedError') {
+                    console.error('[滚轮音量] 打开滚轮画中画失败:', error);
+                }
+                showToast('打开滚轮画中画失败');
+            }
+        }
+
+        /** 打开或关闭自定义滚轮画中画 */
+        async toggleDocumentPictureInPicture() {
+            if (this.documentPipWindow && !this.documentPipWindow.closed) {
+                this.documentPipWindow.close();
+                return;
+            }
+            await this.openDocumentPictureInPicture();
         }
 
         /** 初始化 */
@@ -731,7 +1023,6 @@
                 const video = this.findPlayableVideo();
                 if (video) {
                     this.video = video;
-                    this.setupVolumeBoost();
                     this.setupWheelListener();
                     this.createTriggerZoneElement();
                     this.syncVolumeIndicatorLifecycle();
@@ -743,42 +1034,144 @@
             tryInit();
         }
 
-        /** 释放旧视频的 Web Audio 连接 */
-        resetVolumeBoost() {
+        /** 安全设置增益；滚轮调整使用短暂平滑过渡，复位时立即生效 */
+        setGainValue(gainNode, value, smooth = false) {
+            if (!gainNode) return;
+
+            const gainParam = gainNode.gain;
             try {
-                this.mediaSourceNode?.disconnect();
-                this.gainNode?.disconnect();
-                if (this.audioContext && this.audioContext.state !== 'closed') {
-                    this.audioContext.close().catch(() => {});
+                const now = gainNode.context?.currentTime ?? this.audioContext?.currentTime ?? 0;
+                if (smooth) {
+                    if (typeof gainParam.cancelAndHoldAtTime === 'function') {
+                        gainParam.cancelAndHoldAtTime(now);
+                    } else {
+                        const currentValue = gainParam.value;
+                        gainParam.cancelScheduledValues(now);
+                        gainParam.setValueAtTime(currentValue, now);
+                    }
+                    gainParam.setTargetAtTime(value, now, 0.015);
+                } else {
+                    gainParam.cancelScheduledValues(now);
+                    gainParam.setValueAtTime(value, now);
                 }
             } catch (e) {
-                // 节点可能已经由浏览器断开，无需继续处理。
+                gainParam.value = value;
             }
+        }
 
-            this.audioContext = null;
-            this.mediaSourceNode = null;
-            this.gainNode = null;
-            this.audioVideo = null;
+        /** 复位当前增益但保持音频链连接，供同一 video 的 SPA 换源继续复用 */
+        resetVolumeBoost() {
+            this.setGainValue(this.gainNode, 1.0);
             this.boostMultiplier = 1.0;
         }
 
-        /** 设置音量增益 (Web Audio API) */
-        setupVolumeBoost() {
-            if (!CONFIG.enableVolumeBoost || !this.video) return;
-            if (this.audioVideo === this.video && this.gainNode) return;
+        /** 仅在切换到不同 video 元素或旧元素移除时断开旧链路 */
+        detachVolumeBoost(video = this.audioVideo) {
+            if (!video) return;
 
-            this.resetVolumeBoost();
+            const nodes = this.audioNodes.get(video);
+            if (nodes) {
+                this.setGainValue(nodes.gain, 1.0);
+                if (nodes.connected) {
+                    try {
+                        nodes.gain.disconnect();
+                    } catch (e) {
+                        // 节点可能已经断开，无需处理。
+                    }
+                    nodes.connected = false;
+                }
+            }
+
+            if (this.audioVideo === video) {
+                this.mediaSourceNode = null;
+                this.gainNode = null;
+                this.audioVideo = null;
+            }
+            this.boostMultiplier = 1.0;
+        }
+
+        /** 恢复已被 Web Audio 接管的视频输出，避免它在 100% 以下因节点断开而静音 */
+        reconnectVolumeBoost(video) {
+            const nodes = this.audioNodes.get(video);
+            if (!nodes || nodes.broken || !nodes.source || !nodes.gain || nodes.context.state === 'closed') {
+                return false;
+            }
+
             try {
-                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                this.mediaSourceNode = this.audioContext.createMediaElementSource(this.video);
-                this.gainNode = this.audioContext.createGain();
-                this.mediaSourceNode.connect(this.gainNode);
-                this.gainNode.connect(this.audioContext.destination);
-                this.gainNode.gain.value = 1.0;
-                this.audioVideo = this.video;
+                if (!nodes.connected) {
+                    nodes.gain.connect(nodes.context.destination);
+                    nodes.connected = true;
+                }
+                this.audioContext = nodes.context;
+                this.setGainValue(nodes.gain, 1.0);
+                this.mediaSourceNode = nodes.source;
+                this.gainNode = nodes.gain;
+                this.audioVideo = video;
+                this.boostMultiplier = 1.0;
+                if (nodes.context.state === 'suspended') {
+                    nodes.context.resume().catch(() => {});
+                }
+                return nodes.context.state === 'running';
             } catch (e) {
-                this.resetVolumeBoost();
+                console.warn('[滚轮音量] 恢复视频音频输出失败:', e);
+                return false;
+            }
+        }
+
+        /** 设置音量增益；每个 video 只创建一次 MediaElementSourceNode */
+        setupVolumeBoost() {
+            if (!CONFIG.enableVolumeBoost || !this.isMainPlayerVideo(this.video)) return false;
+            if (this.audioVideo === this.video && this.gainNode) {
+                return this.reconnectVolumeBoost(this.video);
+            }
+
+            try {
+                if (this.audioVideo && this.audioVideo !== this.video) {
+                    this.detachVolumeBoost(this.audioVideo);
+                }
+
+                const cachedNodes = this.audioNodes.get(this.video);
+                if (cachedNodes) {
+                    return this.reconnectVolumeBoost(this.video);
+                }
+
+                if (!this.audioContext || this.audioContext.state === 'closed') {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (this.audioContext.state === 'suspended') {
+                    this.audioContext.resume().catch(() => {});
+                }
+                // 第一次滚轮若尚未恢复运行，先回退到 100%；后续滚轮会再次尝试。
+                if (this.audioContext.state !== 'running') return false;
+
+                // 调用 createMediaElementSource 前先写入尝试标记；即使浏览器抛错也不重复包装同一 video。
+                const nodes = {
+                    source: null,
+                    gain: null,
+                    context: this.audioContext,
+                    connected: false,
+                    broken: true,
+                };
+                this.audioNodes.set(this.video, nodes);
+
+                const gain = this.audioContext.createGain();
+                const source = this.audioContext.createMediaElementSource(this.video);
+                nodes.source = source;
+                nodes.gain = gain;
+                try {
+                    source.connect(gain);
+                    nodes.broken = false;
+                } catch (e) {
+                    throw e;
+                }
+                return this.reconnectVolumeBoost(this.video);
+            } catch (e) {
+                this.mediaSourceNode = null;
+                this.gainNode = null;
+                this.audioVideo = null;
+                this.boostMultiplier = 1.0;
                 console.warn('[滚轮音量] 当前视频无法启用音量增益:', e);
+                return false;
             }
         }
 
@@ -993,16 +1386,22 @@
             let newDisplayVolume = currentDisplayVolume + (direction * step);
             let displayVolume = newDisplayVolume;
 
+            // 超过 100% 时才接入 Web Audio；初始化失败则真实音量和显示都回退到 100%。
+            if (newDisplayVolume > 1 && CONFIG.enableVolumeBoost &&
+                (this.audioVideo !== this.video || !this.gainNode || this.gainNode.context?.state !== 'running') &&
+                !this.setupVolumeBoost()) {
+                newDisplayVolume = 1.0;
+            }
+
             if (newDisplayVolume <= 1) {
                 // 回到普通音量范围，确保不小于0
                 const finalVolume = Math.max(0, newDisplayVolume);
                 this.video.volume = finalVolume;
-                if (CONFIG.enableVolumeBoost && this.gainNode) {
-                    this.boostMultiplier = 1.0;
-                    this.gainNode.gain.value = 1.0;
+                if (CONFIG.enableVolumeBoost && this.audioVideo === this.video && this.gainNode) {
+                    this.resetVolumeBoost();
                 }
                 displayVolume = finalVolume;
-            } else if (CONFIG.enableVolumeBoost && this.gainNode) {
+            } else if (CONFIG.enableVolumeBoost && this.audioVideo === this.video && this.gainNode) {
                 // 超过100%，使用增益
                 this.video.volume = 1.0;
                 const newBoost = this.boostMultiplier + (direction * step);
@@ -1011,11 +1410,10 @@
                     // 增益已到最小值，继续减小则进入普通音量模式（不能小于0）
                     displayVolume = Math.max(0, newBoost);
                     this.video.volume = displayVolume;
-                    this.boostMultiplier = 1.0;
-                    this.gainNode.gain.value = 1.0;
+                    this.resetVolumeBoost();
                 } else {
                     this.boostMultiplier = Math.max(1.0, Math.min(CONFIG.maxVolumeBoost, newBoost));
-                    this.gainNode.gain.value = this.boostMultiplier;
+                    this.setGainValue(this.gainNode, this.boostMultiplier, true);
                     displayVolume = this.boostMultiplier;
                 }
             } else {
@@ -1027,6 +1425,7 @@
 
             this.lastVolume = displayVolume;
             this.updateVolumeIndicator(displayVolume);
+            this.updateDocumentPipVolumeIndicator(displayVolume);
             this.triggerVolumeChange();
         }
 
@@ -1083,7 +1482,10 @@
                     font-variant-numeric: tabular-nums;
                 }
                 .scroll-volume-value.boosted { color: #ff6b6b; }
-                body.scroll-volume-active { cursor: crosshair !important; }
+                body.scroll-volume-active .bpx-player-video-area,
+                body.scroll-volume-active .bpx-player-video-wrap {
+                    cursor: ns-resize !important;
+                }
 
                 /* 设置面板样式 */
                 .bilibili-scroll-volume-settings {
@@ -1390,12 +1792,6 @@
                     border-color: rgba(0, 255, 136, 0.9);
                     background: rgba(0, 255, 136, 0.25);
                 }
-                .sv-trigger-zone.active-zone {
-                    pointer-events: all !important;
-                    /* 完全覆盖区域，拦截滚轮等事件 */
-                    z-index: 2147483643 !important;
-                }
-
                 /* 区域编辑遮罩 */
                 .sv-zone-editor-overlay {
                     position: fixed;
@@ -1532,6 +1928,13 @@
                 <div class="sv-settings-body">
                     <div class="sv-setting-item">
                         <div>
+                            <div class="sv-setting-label">滚轮画中画</div>
+                            <div class="sv-setting-desc">在自定义画中画窗口内直接滚轮调节</div>
+                        </div>
+                        <button class="sv-setting-btn sv-key-btn" id="sv-document-pip-btn">打开滚轮画中画</button>
+                    </div>
+                    <div class="sv-setting-item">
+                        <div>
                             <div class="sv-setting-label">全屏模式</div>
                             <div class="sv-setting-desc">视频/网页全屏时的触发方式</div>
                         </div>
@@ -1640,6 +2043,18 @@
             closeBtn.addEventListener('click', () => {
                 settingsPanel.classList.remove('show');
             });
+
+            const documentPipBtn = document.getElementById('sv-document-pip-btn');
+            if (!window.documentPictureInPicture?.requestWindow) {
+                documentPipBtn.disabled = true;
+                documentPipBtn.textContent = 'Chrome 暂不支持';
+                documentPipBtn.title = '请升级到支持 Document Picture-in-Picture 的 Chrome';
+            } else {
+                documentPipBtn.addEventListener('click', () => {
+                    this.toggleDocumentPictureInPicture();
+                });
+                this.updateDocumentPipButton();
+            }
 
             // 设置面板拖拽功能
             const settingsHeader = settingsPanel.querySelector('.sv-settings-header');
@@ -1853,10 +2268,9 @@
         updateVolumeIndicator(volume) {
             if (!CONFIG.showVolumeIndicator) return;
 
-            // 音量变化前再次同步，确保 SPA 切换后拿到当前播放器中的唯一节点。
-            this.syncVolumeIndicatorLifecycle();
+            // 正常滚轮调整不再扫描页面；媒体生命周期事件负责视频切换同步。
             const indicator = this.volumeIndicator;
-            if (!indicator || !indicator.isConnected) return;
+            if (!indicator || !indicator.isConnected || !this.isPlayableVideo(this.video)) return;
 
             const percentage = Math.round(volume * 100);
             const bar = indicator.querySelector('.scroll-volume-bar');
